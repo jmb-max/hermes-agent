@@ -914,16 +914,17 @@ class SessionDB:
     _WRITE_RETRY_MAX_S = 0.150   # 150ms
     # Attempt a WAL checkpoint every N successful writes (PASSIVE mode).
     _CHECKPOINT_EVERY_N_WRITES = 50
-    # Merge fragmented FTS5 segments every N successful writes. The message
+    # Incrementally merge fragmented FTS5 segments every N successful writes.
     # triggers append one segment per insert; left unmaintained these grow
     # into tens of thousands of segments, so every MATCH must scan them all
     # and every insert pays a growing automerge cost — which lengthens the
     # write-lock hold time and starves competing writers (gateway + cron
     # processes share one state.db), surfacing as "database is locked".
-    # 'optimize' is a no-op once the index is already merged, so an idle DB
-    # pays almost nothing; the cadence is deliberately coarse so the one-off
-    # merge cost is amortised far below the checkpoint cadence.
-    _OPTIMIZE_EVERY_N_WRITES = 1000
+    # A full FTS5 'optimize' rewrites the entire index and can hold the write
+    # lock for minutes on a large state.db.  The write path therefore uses the
+    # bounded 'merge' command, which writes roughly N pages per invocation.
+    _FTS_MERGE_EVERY_N_WRITES = 1000
+    _FTS_MERGE_MAX_PAGES = 500
 
     def __init__(self, db_path: Path = None, read_only: bool = False):
         self.db_path = db_path or DEFAULT_DB_PATH
@@ -1196,8 +1197,8 @@ class SessionDB:
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
                     self._try_wal_checkpoint()
-                if self._write_count % self._OPTIMIZE_EVERY_N_WRITES == 0:
-                    self._try_optimize_fts()
+                if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
+                    self._try_incremental_fts_merge()
                 return result
             except sqlite3.OperationalError as exc:
                 err_msg = str(exc).lower()
@@ -1247,19 +1248,16 @@ class SessionDB:
         except Exception as exc:
             logger.warning("WAL checkpoint (PASSIVE) failed: %s", exc)
 
-    def _try_optimize_fts(self) -> None:
-        """Best-effort FTS5 segment merge. Never raises.
+    def _try_incremental_fts_merge(self) -> None:
+        """Best-effort bounded FTS5 segment merge. Never raises.
 
-        Runs on the ``_OPTIMIZE_EVERY_N_WRITES`` cadence from the write hot
-        path (off the lock — ``optimize_fts`` re-acquires ``self._lock``
-        itself, mirroring ``_try_wal_checkpoint``). ``read_only`` connections
-        never reach the write path, so this is implicitly skipped for them.
-        Once the index is merged the 'optimize' command is close to free, so
-        the steady-state cost is negligible; the expensive case is only the
-        first merge of a long-neglected index.
+        Runs on the ``_FTS_MERGE_EVERY_N_WRITES`` cadence from the write hot
+        path. Unlike ``optimize_fts()``, each command is capped at roughly
+        ``_FTS_MERGE_MAX_PAGES`` pages, preventing a large index rewrite from
+        monopolizing the SQLite write lock.
         """
         try:
-            self.optimize_fts()
+            self.merge_fts(max_pages=self._FTS_MERGE_MAX_PAGES)
         except Exception:
             pass  # Best effort — never fatal.
 
@@ -6417,6 +6415,34 @@ class SessionDB:
             return True
         except sqlite3.OperationalError:
             return False
+
+    def merge_fts(self, *, max_pages: int = 500) -> int:
+        """Perform one bounded FTS5 segment-merge step per index.
+
+        ``max_pages`` is the approximate number of FTS pages each command may
+        write. Unlike :meth:`optimize_fts`, this never requests a full index
+        rewrite, so it is suitable for best-effort maintenance from the write
+        path. Returns the number of available FTS indexes processed.
+        """
+        if max_pages <= 0:
+            raise ValueError("max_pages must be positive")
+        merged = 0
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                return 0
+            for tbl in self._FTS_TABLES:
+                if not self._fts_table_exists(tbl):
+                    continue
+                try:
+                    conn.execute(
+                        f"INSERT INTO {tbl}({tbl}, rank) VALUES('merge', ?)",
+                        (max_pages,),
+                    )
+                    merged += 1
+                except sqlite3.OperationalError as exc:
+                    logger.warning("FTS incremental merge failed for %s: %s", tbl, exc)
+        return merged
 
     def optimize_fts(self) -> int:
         """Merge fragmented FTS5 b-tree segments into one per index.
