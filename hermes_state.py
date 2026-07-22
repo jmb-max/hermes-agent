@@ -852,7 +852,11 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
     DELETE FROM messages_fts WHERE rowid = old.id;
 END;
 
-CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
+CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages
+WHEN old.content IS NOT new.content
+    OR old.tool_name IS NOT new.tool_name
+    OR old.tool_calls IS NOT new.tool_calls
+BEGIN
     DELETE FROM messages_fts WHERE rowid = old.id;
     INSERT INTO messages_fts(rowid, content) VALUES (
         new.id,
@@ -882,7 +886,11 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_delete AFTER DELETE ON message
     DELETE FROM messages_fts_trigram WHERE rowid = old.id;
 END;
 
-CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON messages BEGIN
+CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON messages
+WHEN old.content IS NOT new.content
+    OR old.tool_name IS NOT new.tool_name
+    OR old.tool_calls IS NOT new.tool_calls
+BEGIN
     DELETE FROM messages_fts_trigram WHERE rowid = old.id;
     INSERT INTO messages_fts_trigram(rowid, content) VALUES (
         new.id,
@@ -932,6 +940,10 @@ class SessionDB:
 
         self._lock = threading.Lock()
         self._write_count = 0
+        # A corrupt FTS shadow table makes every indexed message write fail
+        # through the sync triggers. Rebuild at most once per SessionDB
+        # instance so an unrecoverable database cannot enter a repair loop.
+        self._fts_runtime_rebuild_attempted = False
         self._fts_enabled = False
         self._trigram_available = False
         self._fts_unavailable_warned = False
@@ -1094,6 +1106,28 @@ class SessionDB:
         return int(row[0] if not isinstance(row, sqlite3.Row) else row[0])
 
     @staticmethod
+    def _refresh_outdated_fts_update_triggers(cursor: sqlite3.Cursor) -> None:
+        """Drop legacy UPDATE triggers that reindex metadata-only changes.
+
+        ``CREATE TRIGGER IF NOT EXISTS`` cannot replace an installed trigger.
+        Dropping only the two outdated UPDATE triggers lets the declarative
+        FTS DDL recreate them without rebuilding otherwise-current indexes.
+        """
+        markers = (
+            "old.content is not new.content",
+            "old.tool_name is not new.tool_name",
+            "old.tool_calls is not new.tool_calls",
+        )
+        for trigger in ("messages_fts_update", "messages_fts_trigram_update"):
+            row = cursor.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+                (trigger,),
+            ).fetchone()
+            sql = row[0].lower() if row is not None and row[0] else None
+            if sql and not all(marker in sql for marker in markers):
+                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+
+    @staticmethod
     def _rebuild_fts_indexes(
         cursor: sqlite3.Cursor,
         *,
@@ -1213,10 +1247,50 @@ class SessionDB:
                         continue
                 # Non-lock error or retries exhausted — propagate.
                 raise
+            except sqlite3.DatabaseError as exc:
+                if not self._try_runtime_fts_rebuild(exc):
+                    raise
+                continue
         # Retries exhausted (shouldn't normally reach here).
         raise last_err or sqlite3.OperationalError(
             "database is locked after max retries"
         )
+
+    @staticmethod
+    def _is_fts_write_corruption_error(exc: sqlite3.DatabaseError) -> bool:
+        """Recognize SQLite's generic and FTS5-specific corruption errors."""
+        if is_malformed_db_error(exc):
+            return True
+        message = str(exc).lower()
+        return "fts5" in message and "corrupt" in message
+
+    def _try_runtime_fts_rebuild(self, exc: sqlite3.DatabaseError) -> bool:
+        """Rebuild FTS once after an indexed write encounters corruption."""
+        if self._fts_runtime_rebuild_attempted:
+            return False
+        if not self._fts_enabled:
+            return False
+        if not self._is_fts_write_corruption_error(exc):
+            return False
+        self._fts_runtime_rebuild_attempted = True
+        logger.warning(
+            "state.db write failed with an FTS-corruption error (%s) — "
+            "attempting one-shot in-place FTS rebuild; canonical rows are preserved.",
+            exc,
+        )
+        try:
+            rebuilt = self.rebuild_fts()
+        except Exception as rebuild_exc:
+            logger.error("In-place FTS rebuild failed: %s", rebuild_exc)
+            return False
+        if not rebuilt:
+            logger.error("In-place FTS rebuild made no progress.")
+            return False
+        logger.warning(
+            "state.db FTS indexes rebuilt in place (%d); retrying failed write.",
+            rebuilt,
+        )
+        return True
 
     def _try_wal_checkpoint(self) -> None:
         """Best-effort PASSIVE WAL checkpoint.  Never raises.
@@ -1638,6 +1712,7 @@ class SessionDB:
             # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
             # an earlier no-FTS5 runtime.
             triggers_need_repair = self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
+            self._refresh_outdated_fts_update_triggers(cursor)
             self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL)
 
             # Trigram FTS5 for CJK/substring search. This is optional relative
@@ -6482,6 +6557,24 @@ class SessionDB:
                         "FTS optimize failed for %s: %s", tbl, exc
                     )
         return optimized
+
+    def rebuild_fts(self) -> int:
+        """Rebuild FTS5 indexes from the canonical ``messages`` table."""
+        rebuilt = 0
+        with self._lock:
+            for table in self._FTS_TABLES:
+                if not self._fts_table_exists(table):
+                    continue
+                try:
+                    self._conn.execute(
+                        f"INSERT INTO {table}({table}) VALUES('rebuild')"
+                    )
+                    self._conn.commit()
+                    rebuilt += 1
+                except sqlite3.OperationalError as exc:
+                    self._conn.rollback()
+                    logger.warning("FTS rebuild failed for %s: %s", table, exc)
+        return rebuilt
 
     def vacuum(self) -> int:
         """Run VACUUM to reclaim disk space after large deletes.
