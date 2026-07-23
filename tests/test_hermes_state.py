@@ -663,6 +663,47 @@ class TestSessionLifecycle:
         finally:
             db.close()
 
+    def test_disable_trigram_drops_index_and_uses_like_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "state.db"
+        seeded = SessionDB(db_path=db_path)
+        try:
+            seeded.create_session(session_id="s1", source="cli")
+            seeded.append_message("s1", role="user", content="大别山项目 aprobado")
+            assert seeded._fts_table_exists("messages_fts_trigram") is True
+        finally:
+            seeded.close()
+
+        monkeypatch.setenv("HERMES_DISABLE_FTS_TRIGRAM", "1")
+        disabled = SessionDB(db_path=db_path)
+        try:
+            assert disabled._fts_enabled is True
+            assert disabled._trigram_available is False
+            assert disabled._fts_table_exists("messages_fts") is True
+            assert disabled._fts_table_exists("messages_fts_trigram") is False
+            trigger_names = {
+                row[0]
+                for row in disabled._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger' "
+                    "AND name LIKE 'messages_fts_trigram_%'"
+                )
+            }
+            assert trigger_names == set()
+            assert len(disabled.search_messages("大别山项目")) == 1
+            disabled.append_message("s1", role="assistant", content="桂林项目 listo")
+            assert len(disabled.search_messages("桂林项目")) == 1
+        finally:
+            disabled.close()
+
+        reopened = SessionDB(db_path=db_path)
+        try:
+            assert reopened._trigram_available is False
+            assert reopened._fts_table_exists("messages_fts_trigram") is False
+            assert len(reopened.search_messages("大别山项目")) == 1
+        finally:
+            reopened.close()
+
     def test_fts_runtime_restores_triggers_after_no_fts_open(
         self, tmp_path, monkeypatch
     ):

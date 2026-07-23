@@ -17,6 +17,7 @@ Key design decisions:
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 import sqlite3
@@ -166,14 +167,17 @@ _last_init_error_lock = threading.Lock()
 _wal_fallback_warned_paths: set[str] = set()
 _wal_fallback_warned_lock = threading.Lock()
 
-_FTS_TRIGGERS = (
+_BASE_FTS_TRIGGERS = (
     "messages_fts_insert",
     "messages_fts_delete",
     "messages_fts_update",
+)
+_TRIGRAM_FTS_TRIGGERS = (
     "messages_fts_trigram_insert",
     "messages_fts_trigram_delete",
     "messages_fts_trigram_update",
 )
+_FTS_TRIGGERS = _BASE_FTS_TRIGGERS + _TRIGRAM_FTS_TRIGGERS
 
 
 def _set_last_init_error(msg: Optional[str]) -> None:
@@ -1096,17 +1100,36 @@ class SessionDB:
                 pass
 
     @staticmethod
-    def _fts_trigger_count(cursor: sqlite3.Cursor) -> int:
-        placeholders = ",".join("?" for _ in _FTS_TRIGGERS)
+    def _fts_trigger_count(
+        cursor: sqlite3.Cursor,
+        triggers: Tuple[str, ...] = _FTS_TRIGGERS,
+    ) -> int:
+        placeholders = ",".join("?" for _ in triggers)
         row = cursor.execute(
             f"SELECT COUNT(*) FROM sqlite_master "
             f"WHERE type = 'trigger' AND name IN ({placeholders})",
-            _FTS_TRIGGERS,
+            triggers,
         ).fetchone()
         return int(row[0] if not isinstance(row, sqlite3.Row) else row[0])
 
     @staticmethod
-    def _refresh_outdated_fts_update_triggers(cursor: sqlite3.Cursor) -> None:
+    def _trigram_disabled() -> bool:
+        return os.environ.get("HERMES_DISABLE_FTS_TRIGRAM", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+
+    @staticmethod
+    def _drop_trigram_schema(cursor: sqlite3.Cursor) -> None:
+        for trigger in _TRIGRAM_FTS_TRIGGERS:
+            cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        cursor.execute("DROP TABLE IF EXISTS messages_fts_trigram")
+
+    @staticmethod
+    def _refresh_outdated_fts_update_triggers(
+        cursor: sqlite3.Cursor,
+        *,
+        include_trigram: bool = True,
+    ) -> None:
         """Drop legacy UPDATE triggers that reindex metadata-only changes.
 
         ``CREATE TRIGGER IF NOT EXISTS`` cannot replace an installed trigger.
@@ -1118,7 +1141,10 @@ class SessionDB:
             "old.tool_name is not new.tool_name",
             "old.tool_calls is not new.tool_calls",
         )
-        for trigger in ("messages_fts_update", "messages_fts_trigram_update"):
+        update_triggers = ["messages_fts_update"]
+        if include_trigram:
+            update_triggers.append("messages_fts_trigram_update")
+        for trigger in update_triggers:
             row = cursor.execute(
                 "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
                 (trigger,),
@@ -1711,23 +1737,39 @@ class SessionDB:
             # FTS5 setup. Run the DDL even when the virtual table exists so
             # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
             # an earlier no-FTS5 runtime.
-            triggers_need_repair = self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
-            self._refresh_outdated_fts_update_triggers(cursor)
+            trigram_disabled = self._trigram_disabled()
+            expected_triggers = (
+                _BASE_FTS_TRIGGERS if trigram_disabled else _FTS_TRIGGERS
+            )
+            triggers_need_repair = (
+                self._fts_trigger_count(cursor, expected_triggers)
+                < len(expected_triggers)
+            )
+            self._refresh_outdated_fts_update_triggers(
+                cursor,
+                include_trigram=not trigram_disabled,
+            )
             self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL)
 
             # Trigram FTS5 for CJK/substring search. This is optional relative
-            # to the main FTS table; if it cannot be created, CJK search falls
-            # back to LIKE.
+            # to the main FTS table; if disabled or unavailable, CJK search
+            # falls back to LIKE.
             if self._fts_enabled:
-                trigram_enabled = self._ensure_fts_schema(
-                    cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
-                )
-                self._trigram_available = trigram_enabled
-                if triggers_need_repair:
-                    self._rebuild_fts_indexes(
-                        cursor,
-                        include_trigram=trigram_enabled,
+                if trigram_disabled:
+                    self._drop_trigram_schema(cursor)
+                    self._trigram_available = False
+                    if triggers_need_repair:
+                        self._rebuild_fts_indexes(cursor, include_trigram=False)
+                else:
+                    trigram_enabled = self._ensure_fts_schema(
+                        cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
                     )
+                    self._trigram_available = trigram_enabled
+                    if triggers_need_repair:
+                        self._rebuild_fts_indexes(
+                            cursor,
+                            include_trigram=trigram_enabled,
+                        )
 
         self._conn.commit()
 

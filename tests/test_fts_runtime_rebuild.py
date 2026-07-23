@@ -95,6 +95,35 @@ class TestRuntimeFtsRebuild:
         check.rollback()
         check.close()
 
+    def test_disable_trigram_drops_corrupt_index_without_touching_messages(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "state.db"
+        seeded = SessionDB(db_path=db_path)
+        if not seeded._trigram_available:
+            seeded.close()
+            pytest.skip("trigram FTS unavailable in this build")
+        seeded.create_session("s1", source="test")
+        seeded.append_message("s1", "user", "canonical message")
+        seeded.close()
+        _corrupt_fts(db_path, "messages_fts_trigram")
+
+        monkeypatch.setenv("HERMES_DISABLE_FTS_TRIGRAM", "1")
+        disabled = SessionDB(db_path=db_path)
+        try:
+            assert _message_contents(db_path) == ["canonical message"]
+            assert disabled._fts_table_exists("messages_fts") is True
+            assert disabled._fts_table_exists("messages_fts_trigram") is False
+            check = sqlite3.connect(str(db_path))
+            check.execute(
+                "INSERT INTO messages_fts(messages_fts, rank) "
+                "VALUES('integrity-check', 1)"
+            ).fetchall()
+            check.rollback()
+            check.close()
+        finally:
+            disabled.close()
+
     def test_rebuild_is_one_shot_per_instance(self, db, tmp_path):
         if not db._fts_enabled:
             pytest.skip("FTS5 unavailable in this build")
