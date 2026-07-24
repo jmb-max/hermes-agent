@@ -40,6 +40,17 @@ logger = logging.getLogger("agent.lsp")
 _service: Optional[LSPService] = None
 _atexit_registered = False
 _service_lock = threading.Lock()
+_gateway_runtime_publisher = False
+
+
+def mark_gateway_process() -> None:
+    """Mark this process as the authoritative gateway LSP publisher.
+
+    Must be called by gateway startup before the lazy singleton is created.
+    CLI and cron processes intentionally never call this function.
+    """
+    global _gateway_runtime_publisher
+    _gateway_runtime_publisher = True
 
 
 def get_service() -> Optional[LSPService]:
@@ -60,7 +71,10 @@ def get_service() -> Optional[LSPService]:
     with _service_lock:
         if _service is not None:
             return _service if _service.is_active() else None
-        _service = LSPService.create_from_config()
+        if _gateway_runtime_publisher:
+            _service = LSPService.create_from_config(publish_runtime_status=True)
+        else:
+            _service = LSPService.create_from_config()
         if not _atexit_registered:
             # ``atexit`` handlers run in LIFO order on normal Python
             # exit and on SystemExit, but NOT on os._exit() or
@@ -103,4 +117,9 @@ def _atexit_shutdown() -> None:
         logger.debug("atexit LSP shutdown failed: %s", e)
 
 
-__all__ = ["get_service", "shutdown_service", "LSPService"]
+__all__ = [
+    "get_service",
+    "mark_gateway_process",
+    "shutdown_service",
+    "LSPService",
+]

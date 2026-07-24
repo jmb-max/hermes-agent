@@ -158,6 +158,11 @@ lsp:
   #   manual  — only use binaries already on PATH
   install_strategy: auto
 
+  # Lifecycle controls. Zero disables the corresponding timeout/limit.
+  idle_timeout_seconds: 600
+  reaper_interval_seconds: 30
+  max_clients: 2
+
   # Per-server overrides (all optional).
   servers:
     pyright:
@@ -209,9 +214,13 @@ budget is `wait_timeout` seconds — typically the server responds in
 tens of milliseconds for pyright/tsserver and a few seconds for
 rust-analyzer mid-indexing.
 
-Servers are kept alive for the life of the Hermes process. There's
-no idle-timeout reaper — the cost of restarting the server's index
-on every write would be far higher than holding the daemon.
+Idle clients are reaped after `idle_timeout_seconds` and restarted lazily
+on the next write. Hermes keeps at most `max_clients` running or spawning
+clients per process; when the cap is reached it evicts the least-recently-used
+inactive client. A client with an in-flight operation is never selected for
+idle reap or LRU eviction. Shutdown first sends the LSP `shutdown`/`exit`
+sequence, then terminates the complete process group so server descendants do
+not become orphans.
 
 ## Disabling
 
@@ -230,6 +239,16 @@ lsp:
 ```
 
 ## Troubleshooting
+
+**`hermes lsp status` shows `source: no-live-runtime`**
+
+The command did not find a fresh snapshot from the running gateway process.
+It reports configured lifecycle values but does not create a second local LSP
+singleton. When the gateway has initialized LSP, the source becomes
+`gateway-runtime` and the output includes its publisher PID, client PIDs,
+idle durations, active-operation counts, and reap/eviction totals. Snapshots
+are written atomically under `<HERMES_HOME>/runtime/lsp-status.json` and stale
+or dead-publisher snapshots are ignored.
 
 **`hermes lsp status` shows a server as "missing"**
 

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -56,6 +57,29 @@ def write_message(obj):
 
 def main():
     script = os.environ.get("MOCK_LSP_SCRIPT", "clean")
+    pid_file = os.environ.get("MOCK_LSP_PID_FILE")
+    if pid_file:
+        with open(pid_file, "w", encoding="utf-8") as handle:
+            handle.write(str(os.getpid()))
+    child_pid_file = os.environ.get("MOCK_LSP_CHILD_PID_FILE")
+    if child_pid_file:
+        ready = (
+            f"open({child_pid_file!r}, 'w', encoding='utf-8').write(str(__import__('os').getpid())); "
+        )
+        child_code = ready + "import time; time.sleep(60)"
+        if os.environ.get("MOCK_LSP_CHILD_IGNORE_TERM") == "1":
+            child_code = (
+                "import signal,time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                + ready
+                + "time.sleep(60)"
+            )
+        subprocess.Popen(
+            [sys.executable, "-c", child_code],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
     while True:
         msg = read_message()

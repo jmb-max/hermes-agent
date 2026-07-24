@@ -35,10 +35,13 @@ in-process syntax check.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import threading
 import time
+import uuid
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from agent.lsp import eventlog
@@ -59,6 +62,53 @@ from agent.lsp.workspace import (
 logger = logging.getLogger("agent.lsp.manager")
 
 DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get reaped
+DEFAULT_REAPER_INTERVAL = 30
+DEFAULT_MAX_CLIENTS = 2
+
+
+class _RuntimeStatusLock:
+    """Cross-process lock for atomic runtime snapshot ownership changes."""
+
+    def __init__(self, status_path: Path) -> None:
+        self._path = status_path.with_name(f"{status_path.name}.lock")
+        self._handle = None
+
+    def __enter__(self):
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = open(self._path, "a+b")
+        try:
+            os.chmod(self._path, 0o600)
+            if os.name == "nt":
+                import msvcrt
+
+                self._handle.seek(0)
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            self._handle.close()
+            self._handle = None
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._handle is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                self._handle.seek(0)
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._handle.close()
+            self._handle = None
 
 
 class _BackgroundLoop:
@@ -116,6 +166,18 @@ class _BackgroundLoop:
             fut.cancel()
             raise
 
+    def submit(self, coro):
+        """Submit a long-lived coroutine without blocking the caller."""
+        from agent.async_utils import safe_schedule_threadsafe
+        if self._loop is None:
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            raise RuntimeError("background loop not started")
+        fut = safe_schedule_threadsafe(coro, self._loop)
+        if fut is None:
+            raise RuntimeError("background loop not running")
+        return fut
+
     def stop(self) -> None:
         loop = self._loop
         if loop is None:
@@ -155,6 +217,9 @@ class LSPService:
         init_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
         disabled_servers: Optional[List[str]] = None,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        reaper_interval: float = DEFAULT_REAPER_INTERVAL,
+        max_clients: int = DEFAULT_MAX_CLIENTS,
+        publish_runtime_status: bool = False,
     ) -> None:
         self._enabled = enabled
         self._wait_mode = wait_mode if wait_mode in {"document", "full"} else "document"
@@ -164,18 +229,29 @@ class LSPService:
         self._env_overrides = env_overrides or {}
         self._init_overrides = init_overrides or {}
         self._disabled_servers = set(disabled_servers or [])
-        self._idle_timeout = idle_timeout
+        self._idle_timeout = max(0.0, float(idle_timeout))
+        self._reaper_interval = max(0.0, float(reaper_interval))
+        self._max_clients = max(0, int(max_clients))
 
         self._loop = _BackgroundLoop()
-        if self._enabled:
-            self._loop.start()
 
         # Per-(server_id, workspace_root) state
         self._clients: Dict[Tuple[str, str], LSPClient] = {}
         self._broken: set = set()
         self._spawning: Dict[Tuple[str, str], asyncio.Future] = {}
+        self._spawn_tasks: Dict[Tuple[str, str], asyncio.Task] = {}
         self._last_used: Dict[Tuple[str, str], float] = {}
+        self._active_operations: Dict[Tuple[str, str], int] = {}
         self._state_lock = threading.Lock()
+        self._reaper_future = None
+        self._reaper_task: Optional[asyncio.Task] = None
+        self._shutting_down = False
+        self._reaped_total = 0
+        self._evicted_total = 0
+        self._runtime_status_path = (
+            _runtime_status_path() if publish_runtime_status else None
+        )
+        self._runtime_publisher_instance_id = uuid.uuid4().hex
 
         # Delta baseline: file path → snapshot of diagnostics taken
         # immediately before a write.  ``get_diagnostics_sync`` filters
@@ -183,8 +259,18 @@ class LSPService:
         # introduced by the current edit.
         self._delta_baseline: Dict[str, List[Dict[str, Any]]] = {}
 
+        if self._enabled:
+            self._loop.start()
+            if self._idle_timeout > 0 and self._reaper_interval > 0:
+                self._reaper_future = self._loop.submit(self._reaper_loop())
+            self._publish_runtime_status()
+
     @classmethod
-    def create_from_config(cls) -> Optional["LSPService"]:
+    def create_from_config(
+        cls,
+        *,
+        publish_runtime_status: bool = False,
+    ) -> Optional["LSPService"]:
         """Build a service from ``hermes_cli.config`` settings.
 
         Returns ``None`` if the config can't be loaded.  The service
@@ -203,8 +289,23 @@ class LSPService:
 
         enabled = bool(lsp_cfg.get("enabled", True))
         wait_mode = lsp_cfg.get("wait_mode", "document")
-        wait_timeout = float(lsp_cfg.get("wait_timeout", DIAGNOSTICS_DOCUMENT_WAIT))
+        wait_timeout = _nonnegative_float(
+            lsp_cfg.get("wait_timeout", DIAGNOSTICS_DOCUMENT_WAIT),
+            DIAGNOSTICS_DOCUMENT_WAIT,
+        )
         install_strategy = lsp_cfg.get("install_strategy", "auto")
+        idle_timeout = _nonnegative_float(
+            lsp_cfg.get("idle_timeout_seconds", DEFAULT_IDLE_TIMEOUT),
+            DEFAULT_IDLE_TIMEOUT,
+        )
+        reaper_interval = _nonnegative_float(
+            lsp_cfg.get("reaper_interval_seconds", DEFAULT_REAPER_INTERVAL),
+            DEFAULT_REAPER_INTERVAL,
+        )
+        max_clients = _nonnegative_int(
+            lsp_cfg.get("max_clients", DEFAULT_MAX_CLIENTS),
+            DEFAULT_MAX_CLIENTS,
+        )
         servers_cfg = lsp_cfg.get("servers") or {}
         disabled = []
         binary_overrides: Dict[str, List[str]] = {}
@@ -235,6 +336,10 @@ class LSPService:
             env_overrides=env_overrides,
             init_overrides=init_overrides,
             disabled_servers=disabled,
+            idle_timeout=idle_timeout,
+            reaper_interval=reaper_interval,
+            max_clients=max_clients,
+            publish_runtime_status=publish_runtime_status,
         )
 
     # ------------------------------------------------------------------
@@ -435,19 +540,23 @@ class LSPService:
         """Tear down all clients and stop the background loop."""
         if not self._enabled:
             return
+        self._shutting_down = True
         try:
             self._loop.run(self._shutdown_async(), timeout=10.0)
         except Exception as e:  # noqa: BLE001
             logger.debug("LSP shutdown error: %s", e)
-        self._loop.stop()
-        clear_cache()
+        finally:
+            self._loop.stop()
+            clear_cache()
+            self._enabled = False
+            self._remove_runtime_status()
 
     # ------------------------------------------------------------------
     # async internals
     # ------------------------------------------------------------------
 
     async def _snapshot_async(self, file_path: str) -> List[Dict[str, Any]]:
-        client = await self._get_or_spawn(file_path)
+        client = await self._acquire_client(file_path)
         if client is None:
             return []
         try:
@@ -456,11 +565,12 @@ class LSPService:
         except Exception as e:  # noqa: BLE001
             logger.debug("snapshot open/wait failed: %s", e)
             return []
-        self._last_used[(client.server_id, client.workspace_root)] = time.time()
+        finally:
+            self._release_client(client)
         return list(client.diagnostics_for(file_path))
 
     async def _open_and_wait_async(self, file_path: str) -> List[Dict[str, Any]]:
-        client = await self._get_or_spawn(file_path)
+        client = await self._acquire_client(file_path)
         if client is None:
             return []
         try:
@@ -470,8 +580,32 @@ class LSPService:
         except Exception as e:  # noqa: BLE001
             logger.debug("open/wait failed for %s: %s", file_path, e)
             return []
-        self._last_used[(client.server_id, client.workspace_root)] = time.time()
+        finally:
+            self._release_client(client)
         return list(client.diagnostics_for(file_path))
+
+    async def _acquire_client(self, file_path: str) -> Optional[LSPClient]:
+        client = await self._get_or_spawn(file_path)
+        if client is None:
+            return None
+        key = (client.server_id, client.workspace_root)
+        with self._state_lock:
+            if self._clients.get(key) is not client:
+                return None
+            self._active_operations[key] = self._active_operations.get(key, 0) + 1
+            self._last_used[key] = time.monotonic()
+        return client
+
+    def _release_client(self, client: LSPClient) -> None:
+        key = (client.server_id, client.workspace_root)
+        with self._state_lock:
+            count = self._active_operations.get(key, 0)
+            if count <= 1:
+                self._active_operations.pop(key, None)
+            else:
+                self._active_operations[key] = count - 1
+            if self._clients.get(key) is client:
+                self._last_used[key] = time.monotonic()
 
     async def _current_diags_async(self, file_path: str) -> List[Dict[str, Any]]:
         ws, gated = resolve_workspace_for_file(file_path)
@@ -485,6 +619,8 @@ class LSPService:
         return list(client.diagnostics_for(file_path))
 
     async def _get_or_spawn(self, file_path: str) -> Optional[LSPClient]:
+        if self._shutting_down:
+            return None
         srv = find_server_for_file(file_path)
         if srv is None:
             return None
@@ -513,16 +649,26 @@ class LSPService:
             spawning = self._spawning.get(key)
         if spawning is not None:
             try:
-                return await spawning
+                return await asyncio.shield(spawning)
             except Exception:  # noqa: BLE001
                 return None
 
-        # Begin spawn
+        # Begin spawn.  The reservation is inserted before any await so
+        # concurrent workspace requests count toward the hard client cap.
         loop = asyncio.get_running_loop()
         spawn_future: asyncio.Future = loop.create_future()
+        spawn_task = asyncio.current_task()
+        if spawn_task is None:
+            return None
         with self._state_lock:
+            if self._shutting_down:
+                return None
             self._spawning[key] = spawn_future
+            self._spawn_tasks[key] = spawn_task
         try:
+            if not await self._ensure_capacity_async():
+                spawn_future.set_result(None)
+                return None
             ctx = ServerContext(
                 workspace_root=per_server_root,
                 install_strategy=self._install_strategy,
@@ -558,20 +704,122 @@ class LSPService:
                 return None
             with self._state_lock:
                 self._clients[key] = client
-            self._last_used[key] = time.time()
+            self._last_used[key] = time.monotonic()
             eventlog.log_active(srv.server_id, per_server_root)
             spawn_future.set_result(client)
+            self._publish_runtime_status()
             return client
         finally:
+            if not spawn_future.done():
+                spawn_future.set_result(None)
             with self._state_lock:
                 self._spawning.pop(key, None)
+                if self._spawn_tasks.get(key) is spawn_task:
+                    self._spawn_tasks.pop(key, None)
+
+    async def _ensure_capacity_async(self) -> bool:
+        """Honor the client cap, evicting only the inactive LRU client."""
+        if self._max_clients <= 0:
+            return True
+        evicted: List[LSPClient] = []
+        with self._state_lock:
+            excess = len(self._clients) + len(self._spawning) - self._max_clients
+            if excess <= 0:
+                return True
+            candidates = sorted(
+                (
+                    key
+                    for key in self._clients
+                    if self._active_operations.get(key, 0) == 0
+                ),
+                key=lambda k: self._last_used.get(k, 0.0),
+            )
+            if len(candidates) < excess:
+                return False
+            for oldest in candidates[:excess]:
+                client = self._clients.pop(oldest)
+                self._last_used.pop(oldest, None)
+                self._active_operations.pop(oldest, None)
+                self._evicted_total += 1
+                evicted.append(client)
+        if evicted:
+            await self._shutdown_clients_safely(evicted)
+            self._publish_runtime_status()
+        return True
+
+    @staticmethod
+    async def _shutdown_clients_safely(clients: List[LSPClient]) -> None:
+        cleanup = asyncio.gather(
+            *(client.shutdown() for client in clients),
+            return_exceptions=True,
+        )
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            await cleanup
+            raise
+
+    async def _reaper_loop(self) -> None:
+        task = asyncio.current_task()
+        self._reaper_task = task
+        try:
+            while not self._shutting_down:
+                await asyncio.sleep(self._reaper_interval)
+                if not self._shutting_down:
+                    await self._reap_idle_async()
+                    self._publish_runtime_status()
+        except asyncio.CancelledError:
+            return
+        finally:
+            if self._reaper_task is task:
+                self._reaper_task = None
+
+    async def _reap_idle_async(self, *, now: Optional[float] = None) -> None:
+        """Stop idle clients while preserving every active operation lease."""
+        if self._idle_timeout <= 0:
+            return
+        current = time.monotonic() if now is None else now
+        stale: List[LSPClient] = []
+        with self._state_lock:
+            for key, client in list(self._clients.items()):
+                idle_for = current - self._last_used.get(key, current)
+                if idle_for <= self._idle_timeout:
+                    continue
+                if self._active_operations.get(key, 0) > 0:
+                    continue
+                self._clients.pop(key, None)
+                self._last_used.pop(key, None)
+                self._active_operations.pop(key, None)
+                self._reaped_total += 1
+                stale.append(client)
+        if stale:
+            await self._shutdown_clients_safely(stale)
 
     async def _shutdown_async(self) -> None:
+        reaper_task = self._reaper_task
+        if reaper_task is not None and reaper_task is not asyncio.current_task():
+            reaper_task.cancel()
+            await asyncio.gather(reaper_task, return_exceptions=True)
+        self._reaper_task = None
+        self._reaper_future = None
         with self._state_lock:
+            spawn_tasks = [
+                task
+                for task in self._spawn_tasks.values()
+                if task is not asyncio.current_task()
+            ]
+        for task in spawn_tasks:
+            task.cancel()
+        if spawn_tasks:
+            await asyncio.gather(*spawn_tasks, return_exceptions=True)
+        with self._state_lock:
+            self._spawning.clear()
+            self._spawn_tasks.clear()
             clients = list(self._clients.values())
             self._clients.clear()
             self._broken.clear()
             self._last_used.clear()
+            self._active_operations.clear()
         await asyncio.gather(
             *(c.shutdown() for c in clients),
             return_exceptions=True,
@@ -581,8 +829,55 @@ class LSPService:
     # status / introspection (used by ``hermes lsp status``)
     # ------------------------------------------------------------------
 
+    def _publish_runtime_status(self) -> None:
+        path = self._runtime_status_path
+        if path is None:
+            return
+        temp_path: Optional[Path] = None
+        try:
+            payload = self.get_status()
+            payload.update(
+                {
+                    "source": "gateway-runtime",
+                    "publisher_pid": os.getpid(),
+                    "publisher_instance_id": self._runtime_publisher_instance_id,
+                    "updated_at_epoch": time.time(),
+                }
+            )
+            with _RuntimeStatusLock(path):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                candidate = path.with_name(
+                    f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+                )
+                temp_path = candidate
+                candidate.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+                os.chmod(candidate, 0o600)
+                os.replace(candidate, path)
+                temp_path = None
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("unable to publish LSP runtime status: %s", exc)
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+
+    def _remove_runtime_status(self) -> None:
+        path = self._runtime_status_path
+        if path is None:
+            return
+        try:
+            with _RuntimeStatusLock(path):
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if (
+                    payload.get("publisher_pid") == os.getpid()
+                    and payload.get("publisher_instance_id")
+                    == self._runtime_publisher_instance_id
+                ):
+                    path.unlink(missing_ok=True)
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            return
+
     def get_status(self) -> Dict[str, Any]:
         """Return a snapshot of the service for the CLI status command."""
+        now = time.monotonic()
         with self._state_lock:
             clients = [
                 {
@@ -590,6 +885,9 @@ class LSPService:
                     "workspace_root": k[1],
                     "state": c.state,
                     "running": c.is_running,
+                    "pid": c.process_id,
+                    "idle_seconds": max(0.0, now - self._last_used.get(k, now)),
+                    "active_operations": self._active_operations.get(k, 0),
                 }
                 for k, c in self._clients.items()
             ]
@@ -599,10 +897,41 @@ class LSPService:
             "wait_mode": self._wait_mode,
             "wait_timeout": self._wait_timeout,
             "install_strategy": self._install_strategy,
+            "idle_timeout_seconds": self._idle_timeout,
+            "reaper_interval_seconds": self._reaper_interval,
+            "max_clients": self._max_clients,
+            "reaped_total": self._reaped_total,
+            "evicted_total": self._evicted_total,
             "clients": clients,
             "broken": broken,
             "disabled_servers": sorted(self._disabled_servers),
         }
+
+
+def _runtime_status_path() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+
+        home = get_hermes_home()
+    except (ImportError, OSError):
+        home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    return home / "runtime" / "lsp-status.json"
+
+
+def _nonnegative_float(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return parsed if parsed >= 0 else float(default)
+
+
+def _nonnegative_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return int(default)
+    return parsed if parsed >= 0 else int(default)
 
 
 def _diag_key(d: Dict[str, Any]) -> str:

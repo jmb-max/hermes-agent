@@ -15,7 +15,12 @@ The handlers are kept here (rather than in
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
+import time
+from pathlib import Path
+from typing import Optional
 
 
 def register_subparser(subparsers: argparse._SubParsersAction) -> None:
@@ -88,17 +93,97 @@ def run_lsp_command(args: argparse.Namespace) -> int:
         return 130
 
 
+def _runtime_status_path() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+
+        home = get_hermes_home()
+    except (ImportError, OSError):
+        home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    return home / "runtime" / "lsp-status.json"
+
+
+def _load_runtime_status() -> Optional[dict]:
+    try:
+        payload = json.loads(_runtime_status_path().read_text(encoding="utf-8"))
+        publisher_pid = int(payload["publisher_pid"])
+        os.kill(publisher_pid, 0)
+        age = time.time() - float(payload["updated_at_epoch"])
+        max_age = max(
+            120.0,
+            4.0 * float(payload.get("reaper_interval_seconds", 30)),
+        )
+        if age < 0 or age > max_age:
+            return None
+        return payload
+    except (
+        FileNotFoundError,
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+        json.JSONDecodeError,
+    ):
+        return None
+
+
+def _safe_nonnegative_float(value, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def _safe_nonnegative_int(value, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def _configured_status() -> dict:
+    from hermes_cli.config import load_config
+
+    config = load_config() or {}
+    if not isinstance(config, dict):
+        config = {}
+    lsp = config.get("lsp") or {}
+    if not isinstance(lsp, dict):
+        lsp = {}
+    return {
+        "source": "no-live-runtime",
+        "publisher_pid": None,
+        "enabled": bool(lsp.get("enabled", True)),
+        "wait_mode": lsp.get("wait_mode", "document"),
+        "wait_timeout": _safe_nonnegative_float(lsp.get("wait_timeout", 5.0), 5.0),
+        "install_strategy": lsp.get("install_strategy", "auto"),
+        "idle_timeout_seconds": _safe_nonnegative_float(
+            lsp.get("idle_timeout_seconds", 600.0),
+            600.0,
+        ),
+        "reaper_interval_seconds": _safe_nonnegative_float(
+            lsp.get("reaper_interval_seconds", 30.0),
+            30.0,
+        ),
+        "max_clients": _safe_nonnegative_int(lsp.get("max_clients", 2), 2),
+        "reaped_total": 0,
+        "evicted_total": 0,
+        "clients": [],
+        "broken": [],
+        "disabled_servers": [],
+    }
+
+
 def _cmd_status(emit_json: bool) -> int:
-    from agent.lsp import get_service
     from agent.lsp.servers import SERVERS
     from agent.lsp.install import detect_status
 
-    svc = get_service()
-    service_active = svc is not None
-    info = svc.get_status() if svc is not None else {"enabled": False}
+    info = _load_runtime_status() or _configured_status()
+    service_active = info.get("source") == "gateway-runtime"
 
     if emit_json:
-        import json
         payload = {
             "service": info,
             "registry": [
@@ -117,7 +202,12 @@ def _cmd_status(emit_json: bool) -> int:
     out = []
     out.append("LSP Service")
     out.append("===========")
+    out.append(f"  source:          {info.get('source', 'unknown')}")
+    out.append(f"  publisher_pid:   {info.get('publisher_pid') or '(none)'}")
     out.append(f"  enabled:         {info.get('enabled', False)}")
+    out.append(f"  idle_timeout:    {info.get('idle_timeout_seconds')}s")
+    out.append(f"  reaper_interval: {info.get('reaper_interval_seconds')}s")
+    out.append(f"  max_clients:     {info.get('max_clients')}")
     if service_active:
         out.append(f"  wait_mode:       {info.get('wait_mode')}")
         out.append(f"  wait_timeout:    {info.get('wait_timeout')}s")
@@ -127,7 +217,9 @@ def _cmd_status(emit_json: bool) -> int:
             out.append(f"  active clients:  {len(clients)}")
             for c in clients:
                 out.append(
-                    f"    - {c['server_id']:20s} state={c['state']:10s} root={c['workspace_root']}"
+                    f"    - {c['server_id']:20s} state={c['state']:10s} "
+                    f"pid={c.get('pid')} idle={c.get('idle_seconds', 0):.1f}s "
+                    f"active={c.get('active_operations', 0)} root={c['workspace_root']}"
                 )
         else:
             out.append("  active clients:  none")

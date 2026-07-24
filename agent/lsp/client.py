@@ -44,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
 import sys
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
@@ -72,6 +73,22 @@ DIAGNOSTICS_FULL_WAIT = 10.0
 DIAGNOSTICS_REQUEST_TIMEOUT = 3.0
 PUSH_DEBOUNCE = 0.15
 SHUTDOWN_GRACE = 1.0  # seconds between SIGTERM and SIGKILL
+
+
+async def _wait_for_process_group_exit(process_group_id: int, *, timeout: float) -> bool:
+    """Wait until a POSIX process group has no remaining members."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        try:
+            os.killpg(process_group_id, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass
+        if asyncio.get_running_loop().time() >= deadline:
+            return False
+        await asyncio.sleep(0.05)
+
 
 # Retry policy for transient ContentModified errors.
 MAX_CONTENT_MODIFIED_RETRIES = 3
@@ -162,6 +179,7 @@ class LSPClient:
 
         # Process + streams
         self._proc: Optional[asyncio.subprocess.Process] = None
+        self._process_group_id: Optional[int] = None
         self._stderr_task: Optional[asyncio.Task] = None
         self._reader_task: Optional[asyncio.Task] = None
 
@@ -226,6 +244,10 @@ class LSPClient:
     def state(self) -> str:
         return self._state
 
+    @property
+    def process_id(self) -> Optional[int]:
+        return self._proc.pid if self._proc is not None else None
+
     async def start(self) -> None:
         """Spawn the server and complete the initialize handshake.
 
@@ -240,7 +262,7 @@ class LSPClient:
             await self._spawn()
             await self._initialize()
             self._state = "running"
-        except Exception:
+        except (asyncio.CancelledError, Exception):
             self._state = "error"
             await self._cleanup_process()
             raise
@@ -280,6 +302,8 @@ class LSPClient:
                 cwd=self._cwd,
                 start_new_session=True,
             )
+            if os.name == "posix":
+                self._process_group_id = os.getpgid(self._proc.pid)
         except FileNotFoundError as e:
             raise LSPProtocolError(
                 f"LSP server binary not found: {cmd[0]} ({e})"
@@ -446,21 +470,58 @@ class LSPClient:
                 pass
         proc = self._proc
         self._proc = None
+        process_group_id = self._process_group_id
+        self._process_group_id = None
         if proc is None:
             return
-        if proc.returncode is None:
+        if os.name == "posix" and process_group_id is not None:
+            try:
+                os.killpg(process_group_id, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
+            except asyncio.TimeoutError:
+                pass
+            group_exited = await _wait_for_process_group_exit(
+                process_group_id,
+                timeout=SHUTDOWN_GRACE,
+            )
+            if not group_exited:
+                try:
+                    os.killpg(process_group_id, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                if proc.returncode is None:
+                    try:
+                        await proc.wait()
+                    except ProcessLookupError:
+                        pass
+                await _wait_for_process_group_exit(
+                    process_group_id,
+                    timeout=SHUTDOWN_GRACE,
+                )
+        elif proc.returncode is None:
             try:
                 proc.terminate()
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
                 except asyncio.TimeoutError:
-                    try:
-                        proc.kill()
-                        await proc.wait()
-                    except ProcessLookupError:
-                        pass
+                    proc.kill()
+                    await proc.wait()
             except ProcessLookupError:
                 pass
+
+        if proc.stdin is not None and not proc.stdin.is_closing():
+            proc.stdin.close()
+            try:
+                await proc.stdin.wait_closed()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+        transport = getattr(proc, "_transport", None)
+        if transport is not None:
+            transport.close()
+        await asyncio.sleep(0)
 
     # ------------------------------------------------------------------
     # request / notification plumbing

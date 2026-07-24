@@ -6792,6 +6792,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             write_runtime_status(gateway_state="starting", exit_reason=None)
         except Exception:
             pass
+        try:
+            from agent.lsp import mark_gateway_process
+
+            mark_gateway_process()
+        except Exception:
+            logger.debug("unable to mark gateway LSP runtime publisher", exc_info=True)
 
         # Log any active supply-chain security advisories. Operators see this
         # in gateway.log and `hermes status` surfaces it; we do NOT block

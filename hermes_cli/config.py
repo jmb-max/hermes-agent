@@ -3123,6 +3123,12 @@ DEFAULT_CONFIG = {
         # ``"off"`` — alias for ``manual``.
         "install_strategy": "auto",
 
+        # Bound background language-server lifetime and resource usage.
+        # Zero disables the corresponding timeout/limit.
+        "idle_timeout_seconds": 600,
+        "reaper_interval_seconds": 30,
+        "max_clients": 2,
+
         # Per-server overrides.  Each key is a server_id from the
         # registry (``pyright``, ``typescript``, ``gopls``,
         # ``rust-analyzer``, etc.) and accepts:
