@@ -115,6 +115,7 @@ def test_does_not_block_inspection_cleanup_or_mentions(command):
         "pytest -q & disown",
         "python worker.py --daemon",
         "systemd-run pytest -q",
+        "pytest -q >out.log 2>&1 &",
     ],
 )
 def test_detects_self_detaching_heavy_commands(command):
@@ -128,6 +129,10 @@ def test_detects_self_detaching_heavy_commands(command):
         "nohup pytest -q",
         "setsid pytest -q",
         "echo harmless &",
+        "pytest -q 2>&1",
+        "pytest -q &>out.log",
+        "pytest -q >&2",
+        "pytest -q <&0",
     ],
 )
 def test_does_not_reject_managed_or_nonheavy_commands(command):

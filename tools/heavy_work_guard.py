@@ -254,7 +254,17 @@ def heavy_work_requests_detach(command: str) -> bool:
     except ValueError:
         return True
 
-    if "&" in tokens:
+    def _is_redirection_ampersand(index: int) -> bool:
+        previous = tokens[index - 1] if index > 0 else ""
+        following = tokens[index + 1] if index + 1 < len(tokens) else ""
+        # shlex emits fd duplication as ['2>', '&', '1'] / ['>', '&', '2']
+        # and combined output redirection as ['&', '>file']. Neither backgrounds.
+        return previous.endswith((">", "<")) or following.startswith(">")
+
+    if any(
+        token == "&" and not _is_redirection_ampersand(index)
+        for index, token in enumerate(tokens)
+    ):
         return True
     lowered = [Path(token).name.lower() for token in tokens]
     if "disown" in lowered or any(
