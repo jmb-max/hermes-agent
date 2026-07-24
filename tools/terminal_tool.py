@@ -42,6 +42,7 @@ import threading
 import atexit
 import shutil
 import subprocess
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -2050,6 +2051,7 @@ def terminal_tool(
         # Force run after user confirmation
         # Note: force parameter is internal only, not exposed to model API
     """
+    lease_stack = ExitStack()
     try:
         if not isinstance(command, str):
             logger.warning(
@@ -2139,10 +2141,74 @@ def terminal_tool(
                     "status": "error",
                 }, ensure_ascii=False)
 
+        # Serialize resource-heavy work before creating or restoring a sandbox.
+        # This keeps concurrent Docker/Modal/Supabase setup from consuming the
+        # host before the guarded command itself starts. The lease stores no
+        # command text and is released by ExitStack on every early return.
+        from tools.approval import get_current_session_key
+        from tools.heavy_work_guard import (
+            acquire_heavy_work_lease,
+            configured_heavy_work_limit,
+            heavy_work_requests_detach,
+        )
+
+        if (
+            configured_heavy_work_limit() > 0
+            and heavy_work_requests_detach(command)
+        ):
+            return json.dumps({
+                "output": "",
+                "exit_code": 78,
+                "error": (
+                    "Heavy-work guard cannot guarantee a slot for a command that "
+                    "self-detaches. Use terminal background=true or PTY mode and "
+                    "run the heavy process in the foreground inside that managed session."
+                ),
+                "status": "unsupported",
+                "heavy_work": True,
+            }, ensure_ascii=False)
+
+        session_key = get_current_session_key(default="") or (task_id or "")
+        heavy_work_lease, heavy_work_conflict = acquire_heavy_work_lease(
+            command,
+            session_key=session_key,
+        )
+        if heavy_work_conflict is not None:
+            owner = heavy_work_conflict.owner
+            owner_category = owner.get("category", "unknown")
+            owner_pid = owner.get("pid", "unknown")
+            return json.dumps({
+                "output": "",
+                "exit_code": 75,
+                "error": (
+                    "Heavy-work concurrency limit reached. "
+                    f"Active category={owner_category}, pid={owner_pid}. "
+                    "Wait for the running test/database/reviewer job to finish "
+                    "or stop it before starting another heavy job."
+                ),
+                "status": "busy",
+                "heavy_work": True,
+            }, ensure_ascii=False)
+        if heavy_work_lease is not None:
+            lease_stack.callback(heavy_work_lease.release)
+            if os.name == "nt" or env_type != "local":
+                return json.dumps({
+                    "output": "",
+                    "exit_code": 78,
+                    "error": (
+                        "Heavy-work guard is fail-closed for this execution backend. "
+                        "A guarded job must run on a POSIX local backend so the job "
+                        "can inherit the kernel-lock FD across a gateway crash."
+                    ),
+                    "status": "unsupported",
+                    "heavy_work": True,
+                }, ensure_ascii=False)
+
         # Start cleanup thread
         _start_cleanup_thread()
 
         # Get or create environment.
+        env: Any = None
         # Use a per-task creation lock so concurrent tool calls for the same
         # task_id wait for the first one to finish creating the sandbox,
         # instead of each creating their own (wasting Modal resources).
@@ -2247,6 +2313,14 @@ def terminal_tool(
                         env = new_env
                     logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
 
+        if env is None:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": "Execution environment could not be prepared",
+                "status": "error",
+            }, ensure_ascii=False)
+
         # Hard-block: gateway lifecycle commands (systemctl/launchctl/hermes
         # restart|stop targeting hermes-gateway) must never run inside the
         # gateway process itself. The restart would SIGTERM the gateway, which
@@ -2349,9 +2423,6 @@ def terminal_tool(
         # to the wrong checkout. get_current_session_key()'s contextvar doesn't
         # cross tool-worker threads, so fall back to the raw task_id (which IS the
         # session_key for the top-level agent) — a stable, thread-safe anchor.
-        from tools.approval import get_current_session_key
-
-        session_key = get_current_session_key(default="") or (task_id or "")
         try:
             env.cwd_owner = session_key
         except Exception:
@@ -2362,6 +2433,9 @@ def terminal_tool(
             # For local backends: uses subprocess.Popen with output buffering.
             # For non-local backends: runs inside the sandbox via env.execute().
             from tools.process_registry import process_registry
+            heavy_work_kwargs: Dict[str, Any] = {}
+            if heavy_work_lease is not None:
+                heavy_work_kwargs["heavy_work_lease"] = heavy_work_lease
 
             effective_cwd = _resolve_command_cwd(
                 workdir=workdir,
@@ -2377,6 +2451,7 @@ def terminal_tool(
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
+                        **heavy_work_kwargs,
                     )
                 else:
                     proc_session = process_registry.spawn_via_env(
@@ -2385,8 +2460,24 @@ def terminal_tool(
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
+                        **heavy_work_kwargs,
                     )
 
+                if (
+                    getattr(proc_session, "exited", False)
+                    and getattr(proc_session, "completion_reason", None) == "failed_start"
+                ):
+                    return json.dumps({
+                        "output": proc_session.output_buffer,
+                        "session_id": proc_session.id,
+                        "pid": proc_session.pid,
+                        "exit_code": proc_session.exit_code if proc_session.exit_code is not None else -1,
+                        "error": "Failed to start background process",
+                        "status": "failed_start",
+                    }, ensure_ascii=False)
+
+                if heavy_work_lease is not None:
+                    lease_stack.pop_all()
                 result_data = {
                     "output": "Background process started",
                     "session_id": proc_session.id,
@@ -2632,7 +2723,10 @@ def terminal_tool(
                         "timeout": effective_timeout,
                         "cwd": command_cwd,
                     }
-                    result = env.execute(command, **execute_kwargs)
+                    from tools.heavy_work_guard import inherit_heavy_work_lease
+
+                    with inherit_heavy_work_lease(heavy_work_lease):
+                        result = env.execute(command, **execute_kwargs)
                 except Exception as e:
                     error_str = str(e).lower()
                     if "timeout" in error_str:
@@ -2795,6 +2889,8 @@ def terminal_tool(
             "traceback": tb_str,
             "status": "error"
         }, ensure_ascii=False)
+    finally:
+        lease_stack.close()
 
 
 def check_terminal_requirements() -> bool:

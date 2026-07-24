@@ -115,6 +115,7 @@ terminal:
   backend: local    # local | docker | ssh | modal | daytona | singularity
   cwd: "."          # Gateway/cron working directory (CLI always uses launch dir)
   timeout: 180      # Per-command timeout in seconds
+  max_concurrent_heavy_jobs: 0  # 0=off; set 1 to serialize heavy jobs
   home_mode: auto   # auto | real | profile — subprocess HOME policy
   env_passthrough: []  # Env var names to forward to sandboxed execution (terminal + execute_code)
   singularity_image: "docker://nikolaik/python-nodejs:python3.11-nodejs20"  # Container image for Singularity backend
@@ -123,6 +124,18 @@ terminal:
 ```
 
 For cloud sandboxes such as Modal and Daytona, `container_persistent: true` means Hermes will try to preserve filesystem state across sandbox recreation. It does not promise that the same live sandbox, PID space, or background processes will still be running later.
+
+### Heavy-work concurrency guard
+
+Set `terminal.max_concurrent_heavy_jobs: 1` on memory-constrained hosts to prevent resource-heavy terminal jobs from overlapping across gateway sessions and worker processes. The guard classifies full test suites, Supabase/PGlite lab commands, and Claude Code/Codex/OpenCode reviewer runs, including common shell wrappers and compound commands. Shell/interpreter execution that is opaque at classification time—such as `eval`, variable expansion, stdin-fed shells, arbitrary interpreter snippets, privilege/resource wrappers, package-exec wrappers, and container launchers—is serialized conservatively as `dynamic-execution`. Inspection and cleanup commands such as `supabase status`, `supabase stop`, `command -v`, and direct `--help`/`--version` remain available.
+
+The guard is non-blocking: when all slots are occupied, the terminal call returns a `busy` result instead of waiting silently. On a POSIX `local` backend, foreground, Hermes-managed `background=true`, and PTY jobs inherit the kernel-lock file descriptor. Releasing the gateway or direct wrapper copy closes only that descriptor; it does not explicitly unlock the shared open-file-description. The slot therefore remains occupied while inheriting descendants retain the FD, even if the gateway crashes. A guarded command that requests its own detachment (`&`, `disown`, daemon/service launch, or explicit detach flags) is rejected as `unsupported`; use Hermes `background=true` or PTY mode and keep the heavy process in the foreground inside that managed session. The guarded execution path is also fail-closed on Windows and remote/container backends, because those jobs cannot safely inherit the host lock across a gateway crash. The default is `0` (disabled) for backward compatibility.
+
+Classification is an operational resource safeguard, not a security sandbox. Opaque execution forms are intentionally over-classified, but Hermes does not inspect arbitrary script files or unknown native binaries, and a program that deliberately closes inherited descriptors is outside the lease contract.
+
+```bash
+hermes config set terminal.max_concurrent_heavy_jobs 1
+```
 
 ### Backend Overview
 

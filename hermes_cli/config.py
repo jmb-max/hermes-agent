@@ -1165,6 +1165,9 @@ DEFAULT_CONFIG = {
         "modal_mode": "auto",
         "cwd": ".",  # Use current directory
         "timeout": 180,
+        # Optional cross-process guard for resource-heavy terminal jobs (test
+        # suites, Supabase/PGlite labs, and AI reviewer CLIs). Zero disables it.
+        "max_concurrent_heavy_jobs": 0,
         # Bounded grace period (seconds) between SIGTERM and an escalated
         # SIGKILL when terminating a host process tree (browser daemons, etc.).
         # A daemon that stalls in its SIGTERM handler is force-killed after this
@@ -6822,6 +6825,7 @@ TERMINAL_CONFIG_ENV_MAP = {
     "modal_mode": "TERMINAL_MODAL_MODE",
     "cwd": "TERMINAL_CWD",
     "timeout": "TERMINAL_TIMEOUT",
+    "max_concurrent_heavy_jobs": "TERMINAL_MAX_CONCURRENT_HEAVY_JOBS",
     "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
     "docker_image": "TERMINAL_DOCKER_IMAGE",
     "docker_forward_env": "TERMINAL_DOCKER_FORWARD_ENV",
