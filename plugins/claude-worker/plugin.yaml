@@ -1,0 +1,8 @@
+name: claude-worker
+version: "0.1.0"
+description: "Delegate coding tasks to an isolated Claude Code CLI subprocess (installed-CLI OAuth only, --strict-mcp-config with an empty generated MCP config, scoped tool allowlist, cwd pinned to an allowlisted repo root). Auto-routes claude-sonnet-5 (default) / claude-opus-5 (architecture, security, hard-debugging, or one controlled post-failure escalation), backed by a per-failure-class circuit breaker with cooldown. On exact Discord canary channels (including threads), direct patch/write_file/skill_manage edits are gated until a claude_worker run has succeeded for that session+repo. Emits redacted JSONL telemetry and an advisory Terra auxiliary-task review for substantial changes. Opt-in via plugins.enabled — fully dark on disk until explicitly enabled."
+author: "Hermes"
+hooks:
+  - pre_gateway_dispatch
+  - pre_tool_call
+  - post_tool_call
