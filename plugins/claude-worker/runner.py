@@ -1387,6 +1387,56 @@ def _git_changed_files(
     return files
 
 
+def _snapshot_file_states(
+    cwd: str, files: List[str],
+) -> Dict[str, Optional[Tuple[int, int, int, int, int]]]:
+    """Capture lightweight metadata for already-dirty paths.
+
+    Evidence only, not a security boundary: this distinguishes unchanged
+    pre-existing dirt from paths modified during one worker run without
+    hashing large repositories.  Lexical containment plus ``lstat`` avoids
+    following a repository symlink outside the configured root.
+    """
+    root = os.path.realpath(cwd)
+    states: Dict[str, Optional[Tuple[int, int, int, int, int]]] = {}
+    for path in files:
+        if not isinstance(path, str) or not path or os.path.isabs(path):
+            continue
+        candidate = os.path.abspath(os.path.join(root, path))
+        try:
+            if os.path.commonpath([root, candidate]) != root:
+                continue
+        except ValueError:
+            continue
+        try:
+            st = os.lstat(candidate)
+        except OSError:
+            states[path] = None
+            continue
+        states[path] = (
+            stat.S_IFMT(st.st_mode), st.st_size, st.st_mtime_ns,
+            st.st_ctime_ns, st.st_ino,
+        )
+    return states
+
+
+def _files_changed_since_baseline(
+    before_files: List[str],
+    before_states: Dict[str, Optional[Tuple[int, int, int, int, int]]],
+    after_files: List[str],
+    after_states: Dict[str, Optional[Tuple[int, int, int, int, int]]],
+) -> List[str]:
+    """Return paths whose Git presence or filesystem state changed."""
+    before_set = set(before_files)
+    after_set = set(after_files)
+    ordered = list(dict.fromkeys(list(after_files) + list(before_files)))
+    return [
+        path for path in ordered
+        if (path in before_set) != (path in after_set)
+        or before_states.get(path) != after_states.get(path)
+    ]
+
+
 def _parse_worker_summary(stdout: str) -> str:
     """Best-effort extraction of Claude's own result text from
     ``--output-format json`` stdout. Never raises; returns "" if stdout
@@ -1525,14 +1575,20 @@ def run_worker(
                 allow_fallback=allow_fallback,
             ))
 
+        baseline_files = _git_changed_files(resolved_cwd, repo_roots=repo_roots)
+        baseline_states = _snapshot_file_states(resolved_cwd, baseline_files)
+
         outcome = _run_attempts(
             task=task, cwd=resolved_cwd, complexity=complexity, cfg=cfg,
         )
 
-        files_touched: List[str] = []
+        after_files = _git_changed_files(resolved_cwd, repo_roots=repo_roots)
+        after_states = _snapshot_file_states(resolved_cwd, after_files)
+        files_touched = _files_changed_since_baseline(
+            baseline_files, baseline_states, after_files, after_states,
+        )
         review_result: Optional[Dict[str, Any]] = None
         if outcome["success"]:
-            files_touched = _git_changed_files(resolved_cwd, repo_roots=repo_roots)
             review_cfg = cfg.get("review") or {}
             if review_cfg.get("enabled", True) and should_review(
                 files_touched, review_cfg.get("min_changed_files", 3)

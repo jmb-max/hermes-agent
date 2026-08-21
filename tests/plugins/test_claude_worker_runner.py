@@ -230,7 +230,11 @@ class TestRunWorkerSuccess:
             )
 
         monkeypatch.setattr(runner, "spawn_claude", _fake_spawn)
-        monkeypatch.setattr(runner, "_git_changed_files", lambda cwd, repo_roots=None: ["a.py"])
+        statuses = iter([[], ["a.py"]])
+        monkeypatch.setattr(
+            runner, "_git_changed_files",
+            lambda cwd, repo_roots=None: next(statuses),
+        )
 
         raw = runner.run_worker(
             {"task": "fix a typo", "cwd": str(repo)}, session_id="sess:1",
@@ -248,6 +252,70 @@ class TestRunWorkerSuccess:
         assert result["breaker"]["open"] is False
         assert result["files_touched"] == ["a.py"]
         assert len(calls) == 1
+
+    def test_preexisting_dirty_file_unchanged_by_worker_is_not_attributed(
+        self, tmp_path, monkeypatch,
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        dirty = repo / "dirty.py"
+        dirty.write_text("already dirty\n")
+        monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
+        monkeypatch.setattr(
+            runner,
+            "spawn_claude",
+            lambda **kwargs: _spawn_result(
+                exit_code=0,
+                stdout=json.dumps({"result": "read only", "is_error": False}),
+                model=kwargs["model"],
+            ),
+        )
+        status_calls = []
+
+        def _dirty_before_and_after(cwd, repo_roots=None):
+            status_calls.append(cwd)
+            return ["dirty.py"]
+
+        monkeypatch.setattr(runner, "_git_changed_files", _dirty_before_and_after)
+
+        result = json.loads(runner.run_worker(
+            {"task": "read only", "cwd": str(repo)},
+            session_id="sess:preexisting-dirty",
+        ))
+
+        assert result["files_touched"] == []
+        assert status_calls == [str(repo.resolve()), str(repo.resolve())]
+
+    def test_preexisting_dirty_file_modified_by_worker_is_attributed(
+        self, tmp_path, monkeypatch,
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        dirty = repo / "dirty.py"
+        dirty.write_text("already dirty\n")
+        monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
+
+        def _fake_spawn(**kwargs):
+            dirty.write_text("changed by worker with a different size\n")
+            return _spawn_result(
+                exit_code=0,
+                stdout=json.dumps({"result": "edited", "is_error": False}),
+                model=kwargs["model"],
+            )
+
+        monkeypatch.setattr(runner, "spawn_claude", _fake_spawn)
+        monkeypatch.setattr(
+            runner,
+            "_git_changed_files",
+            lambda cwd, repo_roots=None: ["dirty.py"],
+        )
+
+        result = json.loads(runner.run_worker(
+            {"task": "edit dirty file", "cwd": str(repo)},
+            session_id="sess:changed-dirty",
+        ))
+
+        assert result["files_touched"] == ["dirty.py"]
 
 
 class TestRunWorkerBreakerOpen:
@@ -417,7 +485,11 @@ class TestReviewIntegration:
             runner, "spawn_claude",
             lambda **kw: _spawn_result(exit_code=0, stdout=json.dumps({"result": "done"}), model=kw["model"]),
         )
-        monkeypatch.setattr(runner, "_git_changed_files", lambda cwd, repo_roots=None: ["a.py", "b.py", "c.py"])
+        statuses = iter([[], ["a.py", "b.py", "c.py"]])
+        monkeypatch.setattr(
+            runner, "_git_changed_files",
+            lambda cwd, repo_roots=None: next(statuses),
+        )
 
         review_calls = []
         monkeypatch.setattr(
@@ -442,7 +514,11 @@ class TestReviewIntegration:
             runner, "spawn_claude",
             lambda **kw: _spawn_result(exit_code=0, stdout=json.dumps({"result": "done"}), model=kw["model"]),
         )
-        monkeypatch.setattr(runner, "_git_changed_files", lambda cwd, repo_roots=None: ["a.py"])
+        statuses = iter([[], ["a.py"]])
+        monkeypatch.setattr(
+            runner, "_git_changed_files",
+            lambda cwd, repo_roots=None: next(statuses),
+        )
 
         review_calls = []
         monkeypatch.setattr(runner, "run_review", lambda **kw: review_calls.append(kw) or {})
@@ -464,7 +540,11 @@ class TestReviewIntegration:
             runner, "spawn_claude",
             lambda **kw: _spawn_result(exit_code=0, stdout=json.dumps({"result": "done"}), model=kw["model"]),
         )
-        monkeypatch.setattr(runner, "_git_changed_files", lambda cwd, repo_roots=None: ["a.py"])
+        statuses = iter([[], ["a.py"]])
+        monkeypatch.setattr(
+            runner, "_git_changed_files",
+            lambda cwd, repo_roots=None: next(statuses),
+        )
         monkeypatch.setattr(
             runner, "run_review", lambda **kw: {"reviewed": False, "error": "aux backend down"},
         )
