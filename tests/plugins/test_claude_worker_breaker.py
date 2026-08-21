@@ -64,6 +64,37 @@ class TestClassifyFailure:
     def test_classifies_other_for_empty_stderr(self):
         assert breaker.classify_failure(1, "") == "other"
 
+    def test_classifies_auth_from_structured_stdout_401(self):
+        stdout = json.dumps({
+            "is_error": True,
+            "terminal_reason": "api_error",
+            "api_error_status": 401,
+            "result": "Failed to authenticate. API Error: 401 OAuth access "
+                      "token has expired. Please obtain a new token.",
+        })
+        assert breaker.classify_failure(1, "", stdout) == "auth"
+
+    def test_structured_stdout_auth_wins_even_with_unrelated_stderr(self):
+        stdout = json.dumps({"is_error": True, "api_error_status": 401})
+        assert breaker.classify_failure(1, "Traceback: something else broke", stdout) == "auth"
+
+    def test_malformed_stdout_json_falls_back_to_stderr_classification(self):
+        assert breaker.classify_failure(1, "OAuth token expired, please run `claude login`", "not json{{{") == "auth"
+
+    def test_malformed_stdout_json_with_no_stderr_signal_is_other(self):
+        assert breaker.classify_failure(1, "", "not json{{{") == "other"
+
+    def test_structured_stdout_non_401_status_falls_back_to_stderr(self):
+        stdout = json.dumps({"is_error": True, "api_error_status": 500})
+        assert breaker.classify_failure(1, "", stdout) == "other"
+
+    def test_structured_stdout_without_is_error_flag_is_ignored(self):
+        stdout = json.dumps({"api_error_status": 401})
+        assert breaker.classify_failure(1, "", stdout) == "other"
+
+    def test_stdout_defaults_to_empty_and_preserves_existing_stderr_classification(self):
+        assert breaker.classify_failure(1, "Error: Invalid API key · Please run /login") == "auth"
+
 
 class TestBreakerStateMachine:
     def test_starts_closed(self):

@@ -1823,7 +1823,7 @@ def _run_attempts(
             break
 
         previous_failure_class = (
-            "timeout" if timed_out else _breaker.classify_failure(exit_code, stderr)
+            "timeout" if timed_out else _breaker.classify_failure(exit_code, stderr, stdout)
         )
         if previous_failure_class in _breaker.BREAKER_CLASSES:
             _breaker.record_failure(

@@ -444,6 +444,70 @@ class TestRunWorkerEscalation:
         assert result["breaker"]["open"] is True
         assert breaker.is_open() is True
 
+    def test_structured_stdout_oauth_401_opens_breaker_and_does_not_escalate(self, tmp_path, monkeypatch):
+        """Claude Code's ``--output-format json`` can exit 1 with empty stderr
+        and the real failure in stdout, e.g. an expired OAuth token. That must
+        classify as ``auth`` (one attempt, breaker opens, no Opus escalation),
+        not ``other`` (which would retry on Opus)."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
+
+        calls = []
+        raw_token_marker = "OAuth access token has expired"
+
+        def _fake_spawn(**kwargs):
+            calls.append(kwargs)
+            stdout = json.dumps({
+                "is_error": True,
+                "terminal_reason": "api_error",
+                "api_error_status": 401,
+                "result": f"Failed to authenticate. API Error: 401 {raw_token_marker}...",
+            })
+            return _spawn_result(exit_code=1, stdout=stdout, stderr="", model=kwargs["model"])
+
+        monkeypatch.setattr(runner, "spawn_claude", _fake_spawn)
+
+        raw = runner.run_worker({"task": "fix it", "cwd": str(repo)}, session_id="sess:6")
+        result = json.loads(raw)
+
+        assert len(calls) == 1
+        assert result["success"] is False
+        assert result["attempts"] == 1
+        assert result["escalated"] is False
+        assert result["failure_class"] == "auth"
+        assert result["breaker"]["open"] is True
+        assert "auth" in result["breaker"]["classes"]
+        assert breaker.is_open() is True
+        assert raw_token_marker not in raw
+
+    def test_malformed_json_stdout_with_generic_failure_still_escalates_safely(self, tmp_path, monkeypatch):
+        """Non-JSON/garbled stdout must never raise and must not be
+        misclassified as auth — it should behave exactly like the existing
+        generic-failure path (escalate once to Opus)."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
+
+        calls = []
+
+        def _fake_spawn(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return _spawn_result(exit_code=1, stdout="not json{{{", stderr="", model=kwargs["model"])
+            return _spawn_result(exit_code=0, stdout=json.dumps({"result": "done", "is_error": False}), model=kwargs["model"])
+
+        monkeypatch.setattr(runner, "spawn_claude", _fake_spawn)
+        monkeypatch.setattr(runner, "_git_changed_files", lambda cwd, repo_roots=None: [])
+
+        raw = runner.run_worker({"task": "fix it", "cwd": str(repo)}, session_id="sess:7")
+        result = json.loads(raw)
+
+        assert len(calls) == 2
+        assert result["success"] is True
+        assert result["escalated"] is True
+        assert breaker.is_open() is False
+
 
 class TestRunWorkerCwdRejection:
     def test_cwd_outside_repo_roots_refuses_without_spawning(self, tmp_path, monkeypatch):

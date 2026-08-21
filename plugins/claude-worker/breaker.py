@@ -43,8 +43,19 @@ def _state_path() -> Path:
     return Path(get_hermes_home()) / "claude-worker" / "breaker.json"
 
 
-def classify_failure(exit_code: Optional[int], stderr: str) -> str:
-    """Classify a failed spawn into one of the breaker classes or ``other``."""
+def classify_failure(exit_code: Optional[int], stderr: str, stdout: str = "") -> str:
+    """Classify a failed spawn into one of the breaker classes or ``other``.
+
+    ``stdout`` is best-effort: ``claude --output-format json`` can exit
+    non-zero with an empty ``stderr`` and the real reason in a structured
+    stdout body (e.g. ``{"is_error": true, "api_error_status": 401}``) —
+    see :func:`_classify_structured_stdout`. That check runs first since it
+    is unambiguous when present; malformed/non-JSON stdout is treated as no
+    signal and falls through to the existing stderr-marker classification.
+    """
+    structured = _classify_structured_stdout(stdout)
+    if structured is not None:
+        return structured
     text = (stderr or "").lower()
     if any(marker in text for marker in _AUTH_MARKERS):
         return "auth"
@@ -53,6 +64,29 @@ def classify_failure(exit_code: Optional[int], stderr: str) -> str:
     if any(marker in text for marker in _EXTRA_USAGE_MARKERS):
         return "extra_usage"
     return "other"
+
+
+def _classify_structured_stdout(stdout: str) -> Optional[str]:
+    """Best-effort auth classification from ``--output-format json`` stdout.
+
+    Only classifies the unambiguous case — ``is_error`` true with an HTTP
+    401 ``api_error_status`` — and never raises on malformed/non-JSON
+    input; anything else (bad JSON, missing fields, a different status
+    code) returns ``None`` so the caller falls back to stderr markers.
+    """
+    if not stdout:
+        return None
+    try:
+        parsed = json.loads(stdout)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if parsed.get("is_error") is not True:
+        return None
+    if parsed.get("api_error_status") == 401:
+        return "auth"
+    return None
 
 
 def _read_state() -> Dict[str, Any]:
