@@ -83,6 +83,7 @@ import subprocess
 import tempfile
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import breaker as _breaker
@@ -940,6 +941,7 @@ def build_claude_docker_command(
     model: str,
     credentials_path: Optional[str],
     container_workdir: Optional[str] = None,
+    cidfile_path: Optional[str] = None,
 ) -> List[str]:
     """Build the full ``docker run`` argv for one isolated claude spawn.
 
@@ -973,6 +975,10 @@ def build_claude_docker_command(
         mounts.append(_bind_mount(real_creds, _policy.CONTAINER_CREDENTIALS_PATH, readonly=True))
 
     docker_opts = _hardening_opts(mounts)
+    if cidfile_path is not None:
+        if not os.path.isabs(cidfile_path) or "\x00" in cidfile_path:
+            raise SpawnRefused("container cidfile path must be an absolute safe path")
+        docker_opts += ["--cidfile", cidfile_path]
     docker_opts += [
         # Claude --print reads the task from stdin. Docker closes container
         # stdin unless --interactive/-i is explicit, which otherwise makes
@@ -1070,6 +1076,46 @@ def _run_subprocess(
     )
 
 
+def _force_remove_container(
+    cidfile: Path, env: Optional[Dict[str, str]] = None,
+) -> None:
+    """Best-effort removal of the exact container created by one spawn.
+
+    Docker's client-side timeout kills ``docker run`` but does not guarantee
+    that the daemon-side container exits. The cidfile lives inside the
+    root-owned per-spawn staging directory and must contain a full 64-character
+    hexadecimal container id; task/model input can never select the removal
+    target. Cleanup never masks the worker's real result.
+    """
+    try:
+        container_id = cidfile.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError):
+        return
+
+    try:
+        if len(container_id) != 64 or any(
+            char not in "0123456789abcdef" for char in container_id.lower()
+        ):
+            logger.error("claude_worker: refusing cleanup for malformed container cidfile")
+            return
+        try:
+            _validate_docker_binary_trust()
+            subprocess.run(
+                [*_docker_base_argv(), "rm", "--force", container_id],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env=env or build_child_env(),
+            )
+        except Exception:
+            logger.exception("claude_worker: failed to remove worker container %s", container_id)
+    finally:
+        try:
+            cidfile.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("claude_worker: failed to remove container cidfile")
+
+
 def _resolve_credentials_path() -> str:
     """Validate the one fixed host OAuth credentials path with ``lstat`` —
     never a symlink-following ``stat``/``os.path.isfile`` — and return it
@@ -1154,12 +1200,14 @@ def spawn_claude(
         # credentials_path directly — stage a re-owned, mode-0400 copy and
         # mount ONLY that; the original path is never passed to docker.
         staged_dir, staged_credentials_path, staged_snapshot = _stage_credentials(creds_fd)
+        cidfile = Path(staged_dir) / "container.cid"
 
         cmd = build_claude_docker_command(
             repo_root=mount_root,
             model=model,
             credentials_path=staged_credentials_path,
             container_workdir=container_cwd,
+            cidfile_path=str(cidfile),
         )
         env = build_child_env(source_env)
 
@@ -1204,17 +1252,21 @@ def spawn_claude(
         start = time.monotonic()
         timed_out = False
         try:
-            completed = _run_subprocess(
-                cmd, cwd=real_cwd, env=env, timeout_seconds=timeout_seconds, stdin_text=task,
-            )
-            exit_code = completed.returncode
-            stdout = completed.stdout or ""
-            stderr = completed.stderr or ""
-        except subprocess.TimeoutExpired as exc:
-            timed_out = True
-            exit_code = None
-            stdout = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
-            stderr = (exc.stderr or "") if isinstance(exc.stderr, str) else ""
+            try:
+                completed = _run_subprocess(
+                    cmd, cwd=real_cwd, env=env, timeout_seconds=timeout_seconds,
+                    stdin_text=task,
+                )
+                exit_code = completed.returncode
+                stdout = completed.stdout or ""
+                stderr = completed.stderr or ""
+            except subprocess.TimeoutExpired as exc:
+                timed_out = True
+                exit_code = None
+                stdout = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
+                stderr = (exc.stderr or "") if isinstance(exc.stderr, str) else ""
+        finally:
+            _force_remove_container(cidfile, env=env)
         duration_ms = int((time.monotonic() - start) * 1000)
     finally:
         os.close(creds_fd)
@@ -1725,6 +1777,16 @@ def _run_attempts(
         if attempt > 0 and _breaker.is_open():
             break
 
+        remaining_budget_seconds = max(
+            0.0,
+            _policy.MAX_TOTAL_ATTEMPT_SECONDS - (duration_ms / 1000.0),
+        )
+        if remaining_budget_seconds <= 0:
+            break
+        attempt_timeout_seconds = min(
+            float(timeout_seconds), remaining_budget_seconds,
+        )
+
         try:
             model, route_reason = _routing.choose_model(
                 task=task, attempt=attempt, complexity=complexity,
@@ -1737,7 +1799,8 @@ def _run_attempts(
 
         try:
             spawn_result = spawn_claude(
-                task=task, cwd=cwd, model=model, timeout_seconds=timeout_seconds,
+                task=task, cwd=cwd, model=model,
+                timeout_seconds=attempt_timeout_seconds,
             )
         except SpawnRefused as exc:
             attempts += 1

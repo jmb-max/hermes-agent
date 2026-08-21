@@ -100,6 +100,12 @@ MODEL_ALLOWLIST = frozenset({"claude-sonnet-5", "claude-opus-5"})
 #: Attempt 0 (Sonnet) plus at most one escalation (Opus). Never configurable.
 MAX_ATTEMPTS = 2
 
+#: Hard wall-clock budget shared by every model attempt in one tool call.
+#: It stays five minutes below the production gateway's 1,800-second timeout,
+#: leaving headroom for evidence collection, telemetry, and the tool response.
+#: Configuration may shorten individual attempts but can never widen this total.
+MAX_TOTAL_ATTEMPT_SECONDS = 1500
+
 
 # ---------------------------------------------------------------------------
 # Sandbox literals (consumed by the isolated runner)

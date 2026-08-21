@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 import stat
+from pathlib import Path
 
 import pytest
 
@@ -736,7 +737,16 @@ class TestSpawnPlumbing:
         assert result["exit_code"] == 0
 
     def test_timeout_is_reported_not_raised(self, monkeypatch, repo):
-        def _timeout(*a, **k):
+        removed = []
+        monkeypatch.setattr(
+            runner, "_force_remove_container",
+            lambda cidfile, env=None: removed.append(cidfile.read_text().strip()),
+            raising=False,
+        )
+
+        def _timeout(cmd, *args, **kwargs):
+            cidfile = Path(cmd[cmd.index("--cidfile") + 1])
+            cidfile.write_text("a" * 64, encoding="ascii")
             raise runner.subprocess.TimeoutExpired(cmd=["docker"], timeout=1)
 
         monkeypatch.setattr(runner, "_run_subprocess", _timeout)
@@ -745,6 +755,7 @@ class TestSpawnPlumbing:
         )
         assert result["timed_out"] is True
         assert result["exit_code"] is None
+        assert removed == ["a" * 64]
 
     def test_no_temp_files_are_left_behind(self, monkeypatch, repo, tmp_path):
         scratch = tmp_path / "tmpdir"

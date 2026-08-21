@@ -24,6 +24,7 @@ runner = load_submodule("runner")
 breaker = load_submodule("breaker")
 telemetry = load_submodule("telemetry")
 config = load_submodule("config")
+policy = load_submodule("policy")
 
 
 @pytest.fixture(autouse=True)
@@ -366,6 +367,39 @@ class TestRunWorkerEscalation:
         assert result["escalated"] is True
         assert result["attempts"] == 2
         assert result["model"] == "claude-opus-5"
+
+    def test_escalation_uses_only_remaining_total_budget(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        monkeypatch.setattr(
+            config, "_load_raw_config",
+            lambda: _cfg_with_roots(repo, isolation={"timeout_seconds": 900}),
+        )
+        calls = []
+
+        def _fake_spawn(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return _spawn_result(
+                    exit_code=1, timed_out=True, duration_ms=900_000,
+                    model=kwargs["model"],
+                )
+            return _spawn_result(
+                exit_code=0, stdout=json.dumps({"result": "done"}),
+                duration_ms=100, model=kwargs["model"],
+            )
+
+        monkeypatch.setattr(runner, "spawn_claude", _fake_spawn)
+        monkeypatch.setattr(runner, "_git_changed_files", lambda cwd, repo_roots=None: [])
+
+        result = json.loads(runner.run_worker(
+            {"task": "hard bug", "cwd": str(repo)}, session_id="sess:budget",
+        ))
+
+        assert result["success"] is True
+        assert [call["timeout_seconds"] for call in calls] == [
+            900, policy.MAX_TOTAL_ATTEMPT_SECONDS - 900,
+        ]
 
     def test_no_third_spawn_after_two_failures(self, tmp_path, monkeypatch):
         repo = tmp_path / "repo"
