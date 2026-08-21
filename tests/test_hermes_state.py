@@ -3,6 +3,8 @@
 import sqlite3
 import time
 import json
+from pathlib import Path
+
 import pytest
 
 import hermes_state
@@ -4413,6 +4415,36 @@ class TestVacuum:
         # Should not raise, even though there's nothing significant to reclaim.
         db.vacuum()
 
+    def test_wal_size_limit_is_bounded(self, db):
+        """WAL mode must use a finite positive journal size limit."""
+        mode = db._conn.execute("PRAGMA journal_mode").fetchone()[0]
+        if str(mode).lower() != "wal":
+            pytest.skip("WAL unavailable on this filesystem")
+        limit = db._conn.execute("PRAGMA journal_size_limit").fetchone()[0]
+        assert limit > 0, "unbounded WAL: state.db-wal never returns disk to the OS"
+
+    def test_vacuum_leaves_wal_truncated(self, db):
+        """VACUUM must checkpoint and bound the WAL it produces."""
+        mode = db._conn.execute("PRAGMA journal_mode").fetchone()[0]
+        if str(mode).lower() != "wal":
+            pytest.skip("WAL unavailable on this filesystem")
+
+        db.create_session(session_id="s1", source="cli")
+        for i in range(500):
+            db.append_message(
+                session_id="s1", role="user", content=f"padding message {i} " * 20
+            )
+        # A zero limit turns this into a contract for the post-VACUUM
+        # checkpoint itself. Merely staying under the production 64 MiB cap
+        # would also pass without the required TRUNCATE.
+        db._conn.execute("PRAGMA journal_size_limit=0")
+        db.vacuum()
+
+        wal = Path(str(db.db_path) + "-wal")
+        assert not wal.exists() or wal.stat().st_size == 0, (
+            f"WAL left at {wal.stat().st_size} bytes after VACUUM"
+        )
+
 
 class TestOptimizeFts:
     def test_optimize_returns_index_count(self, db):
@@ -4911,10 +4943,12 @@ class TestApplyWalProbe:
         conn = _TracingConn(str(db_path))
         try:
             result = apply_wal_with_fallback(conn)
+            limit = conn.execute("PRAGMA journal_size_limit").fetchone()[0]
         finally:
             conn.close()
 
         assert result == "wal"
+        assert limit == hermes_state._WAL_SIZE_LIMIT_BYTES
         # Only the probe should have fired; the set-pragma must NOT appear.
         assert any("PRAGMA journal_mode" == sql.strip() for sql in conn.executed), (
             "probe PRAGMA should have run"
@@ -4941,13 +4975,33 @@ class TestApplyWalProbe:
         conn = _TracingConn(str(db_path))
         try:
             result = apply_wal_with_fallback(conn)
+            limit = conn.execute("PRAGMA journal_size_limit").fetchone()[0]
         finally:
             conn.close()
 
         assert result == "wal"
+        assert limit == hermes_state._WAL_SIZE_LIMIT_BYTES
         assert any("journal_mode=WAL" in sql for sql in conn.executed), (
             "set-pragma must fire on a fresh (non-WAL) connection"
         )
+
+    def test_rejects_wal_when_size_limit_cannot_be_applied(self, tmp_path):
+        """Never report WAL while SQLite still has an unlimited journal."""
+        import sqlite3
+        from hermes_state import apply_wal_with_fallback
+
+        class _RejectLimitConn(sqlite3.Connection):
+            def execute(self, sql, params=()):
+                if "journal_size_limit=" in sql:
+                    raise sqlite3.OperationalError("journal size limit unavailable")
+                return super().execute(sql, params)
+
+        conn = _RejectLimitConn(str(tmp_path / "limit-rejected.db"))
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="journal size limit"):
+                apply_wal_with_fallback(conn)
+        finally:
+            conn.close()
 
     def test_macos_checkpoint_fullsync_barrier_applied(self, tmp_path, monkeypatch):
         """On Darwin, apply_wal_with_fallback sets checkpoint_fullfsync=1 (issue #30636)."""

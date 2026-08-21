@@ -151,6 +151,10 @@ _WAL_INCOMPAT_MARKERS = (
     "not authorized",         # Some FUSE mounts block WAL pragma outright
 )
 
+# SQLite defaults journal_size_limit to -1, preserving the WAL high-water
+# mark forever. Bound it so a large transaction cannot strand gigabytes.
+_WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024
+
 # Last SessionDB() init error, per-process.  Surfaced in /resume and
 # related slash-command error strings so users know WHY the DB is
 # unavailable instead of getting a bare "Session database not available."
@@ -307,6 +311,21 @@ def _on_disk_journal_mode(conn: sqlite3.Connection) -> Optional[str]:
     return str(mode).strip().lower() if mode is not None else None
 
 
+def _apply_wal_size_limit(conn: sqlite3.Connection) -> None:
+    """Require a finite WAL retention cap on this connection."""
+    row = conn.execute(f"PRAGMA journal_size_limit={_WAL_SIZE_LIMIT_BYTES}").fetchone()
+    try:
+        applied = int(row[0]) if row else -1
+    except (TypeError, ValueError, IndexError) as exc:
+        raise sqlite3.OperationalError(
+            f"invalid journal_size_limit result: {row!r}"
+        ) from exc
+    if applied < 0 or applied > _WAL_SIZE_LIMIT_BYTES:
+        raise sqlite3.OperationalError(
+            f"unsafe journal_size_limit={applied}; expected 0..{_WAL_SIZE_LIMIT_BYTES}"
+        )
+
+
 def _apply_macos_checkpoint_barrier(conn: sqlite3.Connection) -> None:
     """Enable ``PRAGMA checkpoint_fullfsync`` on macOS (no-op elsewhere).
 
@@ -371,14 +390,16 @@ def apply_wal_with_fallback(
     # Skipping the set-pragma prevents WAL-init from unlinking files other connections hold open.
     try:
         current_mode = conn.execute("PRAGMA journal_mode").fetchone()
-        if current_mode and current_mode[0] == "wal":
-            _apply_macos_checkpoint_barrier(conn)
-            return "wal"
     except sqlite3.OperationalError:
-        pass
+        current_mode = None
+    if current_mode and current_mode[0] == "wal":
+        _apply_wal_size_limit(conn)
+        _apply_macos_checkpoint_barrier(conn)
+        return "wal"
 
     try:
         conn.execute("PRAGMA journal_mode=WAL")
+        _apply_wal_size_limit(conn)
         _apply_macos_checkpoint_barrier(conn)
         return "wal"
     except sqlite3.OperationalError as exc:
@@ -6648,12 +6669,21 @@ class SessionDB:
             logger.warning("FTS optimize before VACUUM failed: %s", exc)
         # VACUUM cannot be executed inside a transaction.
         with self._lock:
+            conn = self._conn
+            if conn is None:
+                raise RuntimeError("session database connection is closed")
             # Best-effort WAL checkpoint first, then VACUUM.
             try:
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             except Exception as exc:
                 logger.debug("WAL checkpoint (TRUNCATE) before VACUUM failed: %s", exc)
-            self._conn.execute("VACUUM")
+            conn.execute("VACUUM")
+            # VACUUM rewrites every page through WAL. Checkpoint afterwards so
+            # maintenance cannot consume more disk than it reclaims.
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception as exc:
+                logger.debug("WAL checkpoint (TRUNCATE) after VACUUM failed: %s", exc)
         return optimized
 
     def maybe_auto_prune_and_vacuum(
