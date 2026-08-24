@@ -13,12 +13,24 @@ so submodule-level unit tests exercise the same import shape as production.
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 import sys
 import types
 from pathlib import Path
 
 _NS_PARENT = "hermes_plugins"
 _SLUG = "claude_worker_under_test"
+
+#: Prefixes ``plugins/claude-worker/policy.py`` refuses to treat as a project
+#: root at any depth. ``tmp_path`` normally lives under ``/tmp`` (which is
+#: fine — only ``/tmp`` ITSELF is unsafe, not paths beneath it), but a
+#: ``TMPDIR`` pointing into ``/var`` or ``/run`` would make every dynamic-root
+#: test vacuous, so those runs skip loudly instead of quietly passing.
+_UNSAFE_TMP_PREFIXES = (
+    "/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/libx32",
+    "/proc", "/run", "/sbin", "/sys", "/usr", "/var",
+)
 
 
 def repo_root() -> Path:
@@ -71,6 +83,110 @@ def load_submodule(name: str, force: bool = False) -> types.ModuleType:
     if force and full_name in sys.modules:
         del sys.modules[full_name]
     return importlib.import_module(full_name)
+
+
+def require_safe_tmp(tmp_path: Path) -> None:
+    """Skip when ``tmp_path`` itself sits inside a system-sensitive tree.
+
+    The dynamic project-root resolver refuses such roots outright, so a repo
+    built there could never be resolved and a "this is gated" assertion would
+    pass for entirely the wrong reason. Fail visibly (skip) rather than
+    silently.
+    """
+    import pytest
+
+    real = os.path.realpath(str(tmp_path))
+    for prefix in _UNSAFE_TMP_PREFIXES:
+        if real == prefix or real.startswith(prefix.rstrip("/") + "/"):
+            pytest.skip(f"tmp_path {real!r} is inside the system-sensitive tree {prefix!r}")
+
+
+def stub_fresh_oauth_preflight(monkeypatch) -> list:
+    """Make ``oauth.preflight`` report a healthy, non-expired credential.
+
+    ``runner.run_worker`` runs the OAuth freshness preflight before it spawns
+    anything, and production reads the fixed root-owned
+    ``policy.HOST_CREDENTIALS_PATH``, which does not exist under a test
+    ``tmp_path`` home. Without this stub every orchestration test would
+    exercise the auth-HOLD path instead of the behavior it is actually about.
+
+    Returns the list the stub appends one entry to per call, so a caller can
+    assert the preflight ran (and ran exactly once). Tests that are ABOUT the
+    preflight override it again with their own stub, or point
+    ``policy.HOST_CREDENTIALS_PATH`` at a real temporary credentials file and
+    let the production implementation run for real.
+    """
+    oauth = load_submodule("oauth")
+    calls: list = []
+
+    def _fresh(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {
+            "ok": True,
+            "state": oauth.STATE_FRESH,
+            "classification": None,
+            "refresh_attempted": False,
+            "reason": "",
+            "freshness": {"state": oauth.STATE_FRESH, "expired": False},
+        }
+
+    monkeypatch.setattr(oauth, "preflight", _fresh)
+    return calls
+
+
+def write_credentials(
+    path: Path,
+    *,
+    access_token: str = "test-access-token-value",
+    refresh_token: str | None = "test-refresh-token-value",
+    expires_at: float | int | None = None,
+    section: str = "claudeAiOauth",
+) -> Path:
+    """Write a Claude-Code-shaped OAuth credentials file at *path*.
+
+    ``expires_at`` is written verbatim, so a caller controls whether it is
+    seconds or milliseconds since the epoch (``oauth._normalize_expiry``
+    accepts both). ``refresh_token=None`` omits the refresh key entirely.
+    """
+    body: dict = {"accessToken": access_token}
+    if refresh_token is not None:
+        body["refreshToken"] = refresh_token
+    if expires_at is not None:
+        body["expiresAt"] = expires_at
+    body["scopes"] = ["user:inference", "user:profile"]
+    body["subscriptionType"] = "max"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({section: body}), encoding="utf-8")
+    return path
+
+
+def make_git_repo(base: Path, name: str = "repo", *, marker: str = "dir") -> Path:
+    """Create a directory the dynamic resolver accepts as a Git worktree root.
+
+    *marker* ``"dir"`` writes an ordinary ``.git`` DIRECTORY (a normal
+    checkout); ``"file"`` writes a ``.git`` FILE holding the ``gitdir:``
+    pointer git itself writes for a linked worktree or a submodule. Both are
+    valid worktree markers, and covering both here is the point: the ``.git``
+    file shape is exactly what a static allowlist and a naive ``isdir(".git")``
+    check used to miss.
+
+    No ``git init`` is run, so the real git binary — if it is even trusted on
+    this host — has no usable opinion about these directories and the
+    filesystem walk stands alone. That keeps every caller deterministic
+    regardless of whether ``/usr/bin/git`` passes the trust check in the
+    environment the suite happens to run in.
+    """
+    path = base / name if name else base
+    path.mkdir(parents=True, exist_ok=True)
+    if marker == "dir":
+        (path / ".git").mkdir(exist_ok=True)
+    elif marker == "file":
+        (path / ".git").write_text(
+            f"gitdir: {base / (name + '.gitdir')}\n", encoding="utf-8",
+        )
+    else:  # pragma: no cover - programming error in a test
+        raise ValueError(f"unknown .git marker kind: {marker!r}")
+    return path
 
 
 def load_plugin_package(force: bool = False) -> types.ModuleType:

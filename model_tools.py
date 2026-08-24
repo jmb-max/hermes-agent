@@ -978,6 +978,7 @@ def _emit_post_tool_call_hook(
     result: Any,
     task_id: Optional[str] = None,
     session_id: Optional[str] = None,
+    gateway_session_key: Optional[str] = None,
     tool_call_id: Optional[str] = None,
     turn_id: Optional[str] = None,
     api_request_id: Optional[str] = None,
@@ -995,6 +996,11 @@ def _emit_post_tool_call_hook(
     ``status`` is not supplied, the ok/error fields are derived from the
     result *after* the gate (parsing the result is only worth it when a
     listener will actually consume it).
+
+    ``session_id`` stays the transcript id; ``gateway_session_key`` is the
+    optional stable per-chat key passed alongside it, so a plugin that
+    authorizes on a tool RESULT can key that authorization by CHAT rather than
+    by conversation slice.
     """
     try:
         from hermes_cli.plugins import has_hook, invoke_hook
@@ -1009,6 +1015,7 @@ def _emit_post_tool_call_hook(
             result=result,
             task_id=task_id or "",
             session_id=session_id or "",
+            gateway_session_key=gateway_session_key or "",
             tool_call_id=tool_call_id or "",
             turn_id=turn_id or "",
             api_request_id=api_request_id or "",
@@ -1028,6 +1035,7 @@ def handle_function_call(
     task_id: Optional[str] = None,
     tool_call_id: Optional[str] = None,
     session_id: Optional[str] = None,
+    gateway_session_key: Optional[str] = None,
     turn_id: Optional[str] = None,
     api_request_id: Optional[str] = None,
     user_task: Optional[str] = None,
@@ -1045,6 +1053,11 @@ def handle_function_call(
         function_name: Name of the function to call.
         function_args: Arguments for the function.
         task_id: Unique identifier for terminal/browser session isolation.
+        session_id: The transcript session id, unchanged.
+        gateway_session_key: Optional stable per-chat key the gateway built,
+                       forwarded alongside ``session_id`` to the pre/post
+                       tool-call hooks. Callers with no gateway key (the CLI,
+                       and every pre-existing call site) simply omit it.
         user_task: The user's original task (for browser_snapshot context).
         enabled_tools: Tool names enabled for this session.  When provided,
                        execute_code uses this list to determine which sandbox
@@ -1134,6 +1147,7 @@ def handle_function_call(
                 task_id=task_id,
                 tool_call_id=tool_call_id,
                 session_id=session_id,
+                gateway_session_key=gateway_session_key,
                 user_task=user_task,
                 enabled_tools=enabled_tools,
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
@@ -1191,6 +1205,7 @@ def handle_function_call(
                     turn_id=turn_id or "",
                     api_request_id=api_request_id or "",
                     middleware_trace=list(_tool_middleware_trace),
+                    gateway_session_key=gateway_session_key or "",
                 )
             except Exception as _hook_err:
                 logger.debug("pre_tool_call hook error: %s", _hook_err)
@@ -1203,6 +1218,7 @@ def handle_function_call(
                     result=result,
                     task_id=task_id,
                     session_id=session_id,
+                    gateway_session_key=gateway_session_key,
                     tool_call_id=tool_call_id,
                     turn_id=turn_id,
                     api_request_id=api_request_id,
@@ -1303,6 +1319,7 @@ def handle_function_call(
             result=result,
             task_id=task_id,
             session_id=session_id,
+            gateway_session_key=gateway_session_key,
             tool_call_id=tool_call_id,
             turn_id=turn_id,
             api_request_id=api_request_id,

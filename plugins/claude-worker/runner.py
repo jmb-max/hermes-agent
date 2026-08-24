@@ -32,11 +32,18 @@ Six independent safety layers, each fail-closed on its own:
     fixed policy literal, so a hostile ambient ``$PATH`` entry can never
     substitute a fake ``docker`` (which is unreachable anyway, since
     ``policy.DOCKER_BIN`` is an absolute path, never resolved off ``$PATH``).
-  * ``validate_cwd`` — resolves symlinks (``os.path.realpath``) BEFORE the
-    allowlist check, so a symlink planted inside an allowlisted root that
-    points outside it cannot smuggle the worker out of scope. The same
-    realpath-before-mount discipline applies to the repo path handed to the
-    docker command builders.
+  * ``validate_cwd`` — delegates to ``project.resolve_project_root_strict``,
+    the ONE dynamic resolver the write gate also consults, so the runner and
+    the gate can never disagree about what a request's repository is. It
+    resolves symlinks (``os.path.realpath``) BEFORE anything else, so a link
+    planted inside a repo that points outside it is judged where it really
+    goes rather than smuggling the worker out of scope; it accepts only an
+    absolute, existing directory inside a real (non-bare) Git worktree; and
+    the ONE thing mounted at ``/workspace`` is that exact Git root — never a
+    parent holding several checkouts, never a system-sensitive directory,
+    and never a configured allowlist entry (there is no ``gate.repo_roots``
+    authority anymore). The same realpath-before-mount discipline applies to
+    the repo path handed to the docker command builders.
   * ``_validate_trusted_path_chain`` / ``_validate_docker_binary_trust`` /
     ``_open_trusted_credentials`` — every component of the docker binary's
     and the OAuth credentials file's absolute path chains (every parent
@@ -88,9 +95,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from . import breaker as _breaker
 from . import config as _config
+from . import oauth as _oauth
 from . import policy as _policy
+from . import project as _project
 from . import routing as _routing
 from . import telemetry as _telemetry
+from . import trust as _trust
 from .review import run_fallback, run_review, should_review
 from gateway.session_context import get_session_env
 
@@ -165,28 +175,37 @@ def build_child_env(source_env: Optional[Dict[str, str]] = None) -> Dict[str, st
 
 
 class CwdRejected(ValueError):
-    """Raised when the requested cwd is missing or outside every allowlisted root."""
+    """Raised when the requested cwd is missing, is not inside a real Git
+    worktree, or resolves to an unsafe project root."""
 
 
-def validate_cwd(cwd: str, repo_roots: List[str]) -> str:
-    """Resolve *cwd* and ensure it is inside one of *repo_roots*.
+def validate_cwd(cwd: str, repo_roots: Optional[List[str]] = None) -> str:
+    """Resolve *cwd* and confirm it is a safe place for the worker to run.
 
-    Resolves symlinks BEFORE the allowlist check so a symlink that escapes
-    an allowlisted root is rejected rather than followed.
+    Authority is ``project.resolve_project_root_strict`` — the SAME resolver
+    the gate uses — so the two can never disagree: an absolute, existing
+    directory inside a real (non-bare) Git worktree whose canonical root is
+    not system-sensitive. Symlinks resolve BEFORE anything else, so a link
+    that escapes its repository is judged where it really points.
+
+    *repo_roots*, when supplied, is an ADDITIONAL containment constraint for
+    a caller that has its own explicit allowlist (the isolation tests, and
+    any direct caller that pre-validated scope itself). It can only narrow:
+    a cwd outside every supplied root is rejected even if its Git root is
+    otherwise fine. It is never widened into an alternative to the Git check.
     """
     if not cwd:
         raise CwdRejected("cwd is required")
+    try:
+        _project.resolve_project_root_strict(cwd)
+    except _project.ProjectRejected as exc:
+        raise CwdRejected(str(exc)) from exc
+
     real = os.path.realpath(cwd)
-    if not os.path.isdir(real):
-        raise CwdRejected(f"cwd does not exist or is not a directory: {cwd!r}")
-    for root in repo_roots or []:
-        try:
-            real_root = os.path.realpath(root)
-        except (OSError, ValueError):
-            continue
-        if real == real_root or real.startswith(real_root.rstrip(os.sep) + os.sep):
-            return real
-    raise CwdRejected(f"cwd {cwd!r} is outside every allowlisted repo root")
+    if repo_roots:
+        if _contained_root(real, repo_roots) is None:
+            raise CwdRejected(f"cwd {cwd!r} is outside every allowlisted repo root")
+    return real
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +249,7 @@ def _check_cwd_dir_component(path: str) -> os.stat_result:
 
 
 def _contained_root(real_cwd: str, repo_roots: List[str]) -> Optional[str]:
-    """Return the most-specific canonical configured root containing cwd."""
+    """Return the most-specific canonical root from *repo_roots* containing cwd."""
     matches: List[str] = []
     for root in repo_roots or []:
         try:
@@ -240,6 +259,23 @@ def _contained_root(real_cwd: str, repo_roots: List[str]) -> Optional[str]:
         if real_cwd == real_root or real_cwd.startswith(real_root.rstrip(os.sep) + os.sep):
             matches.append(real_root)
     return max(matches, key=len) if matches else None
+
+
+def _effective_roots(real_cwd: str, repo_roots: Optional[List[str]]) -> List[str]:
+    """The roots *real_cwd* must be contained in.
+
+    With no explicit *repo_roots*, that is exactly one root: the canonical
+    Git worktree root ``project.py`` resolves for this cwd — never a parent
+    holding several projects, and never ``/root/worktrees``. An explicit
+    list (a caller with its own allowlist, e.g. the isolation tests) is used
+    verbatim and can only narrow.
+    """
+    if repo_roots:
+        return list(repo_roots)
+    try:
+        return [_project.resolve_project_root_strict(real_cwd)]
+    except _project.ProjectRejected as exc:
+        raise CwdRejected(str(exc)) from exc
 
 
 def _snapshot_mount_root(
@@ -280,8 +316,16 @@ def _snapshot_mount_root(
 def _mount_plan(
     real_cwd: str, repo_roots: Optional[List[str]],
 ) -> Tuple[str, str, Dict[str, Tuple[int, int, int, int, int]]]:
-    """Return protected host mount root, in-container cwd, and root snapshot."""
-    roots = repo_roots if repo_roots else [real_cwd]
+    """Return protected host mount root, in-container cwd, and root snapshot.
+
+    With no explicit *repo_roots* the mount root is the canonical Git
+    worktree root of *real_cwd* — the ONE directory that gets bind-mounted
+    at ``/workspace``. That is deliberately the repository itself and never
+    an enclosing directory: mounting ``/root/worktrees`` (or any parent
+    holding several checkouts) would hand a worker asked to touch one
+    project write access to all of its siblings.
+    """
+    roots = _effective_roots(real_cwd, repo_roots)
     mount_root = _contained_root(real_cwd, roots)
     if mount_root is None:
         raise CwdRejected(f"cwd {real_cwd!r} is outside every allowlisted repo root")
@@ -333,11 +377,12 @@ def snapshot_repo_cwd_chain(
     ``lstat`` every directory component from ``/`` through the resolved cwd
     — none may be a symlink.
 
-    When *repo_roots* is not supplied, the resolved cwd is treated as its
-    own sole allowed root — this preserves a direct ``spawn_claude`` caller
-    that has already validated containment itself (every isolation test in
-    this suite that predates ``repo_roots``), while the chain/symlink
-    protection below still applies unconditionally.
+    When *repo_roots* is not supplied, containment is checked against the
+    canonical Git worktree root ``project.py`` resolves for this cwd — the
+    same answer the gate gets — so a cwd that is not inside a real Git
+    worktree, or whose root is system-sensitive, is rejected here rather
+    than silently treated as its own root. An explicit *repo_roots* list is
+    honored as-is for callers that already validated containment themselves.
 
     Returns the resolved cwd and an identity snapshot — ``{component: (dev,
     ino, mode, uid, gid)}`` — for later re-validation via
@@ -352,7 +397,7 @@ def snapshot_repo_cwd_chain(
     if not os.path.isdir(real):
         raise CwdRejected(f"cwd does not exist or is not a directory: {cwd!r}")
 
-    roots = repo_roots if repo_roots else [cwd]
+    roots = _effective_roots(real, repo_roots)
     if _contained_root(real, roots) is None:
         raise CwdRejected(f"cwd {cwd!r} is outside every allowlisted repo root")
 
@@ -402,147 +447,21 @@ def _revalidate_repo_cwd_chain(
 # ---------------------------------------------------------------------------
 
 
-class TrustViolation(RuntimeError):
-    """A component of a trusted absolute path chain failed validation:
-    missing, a symlink, the wrong type, not owned by ``_TRUSTED_UID``, or
-    writable by anyone but its owner (sticky-bit directories like ``/tmp``
-    excepted). Raised by ``_validate_trusted_path_chain`` and by the
-    identity re-check done immediately before a subprocess call."""
-
-
-#: The only uid ever allowed to own a component of a trusted path chain.
-_TRUSTED_UID = 0
-
-
-def _parent_dirs(path: str) -> List[str]:
-    """Every directory component of an absolute *path*, from ``/`` up to
-    (but not including) the final component itself."""
-    parts = [p for p in path.split(os.sep) if p][:-1]
-    parents = [os.sep]
-    current = os.sep
-    for part in parts:
-        current = os.path.join(current, part)
-        parents.append(current)
-    return parents
-
-
-def _stat_identity(st: os.stat_result) -> Tuple[int, int, int, int, int]:
-    """The subset of ``stat`` fields that together identify one exact
-    filesystem object: device, inode, mode, owner, group. A replacement —
-    even one with the same path, same size, same content — changes at
-    least the inode."""
-    return (st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_gid)
-
-
-def _writable_by_others(mode: int) -> bool:
-    """True if *mode* is group- or world-writable, EXCEPT a world-writable
-    directory that also has the sticky bit set (``/tmp`` and friends): the
-    sticky bit means only a file's own owner may rename or delete it, which
-    is the standard, safe multi-writer directory convention every major OS
-    and security tool (sshd, sudo, PAM) already treats as non-hostile."""
-    if mode & stat.S_ISVTX:
-        return False
-    return bool(mode & (stat.S_IWGRP | stat.S_IWOTH))
-
-
-def _check_dir_component(path: str) -> os.stat_result:
-    """Validate one directory component of a trusted path chain: must
-    exist, must not be a symlink, must be a real directory, must be owned
-    by ``_TRUSTED_UID``, and must not be writable by anyone but its owner
-    (subject to the sticky-bit exception above)."""
-    try:
-        st = os.lstat(path)
-    except OSError as exc:
-        raise TrustViolation(
-            f"cannot stat trusted path component {path!r}: {exc}"
-        ) from exc
-    if stat.S_ISLNK(st.st_mode):
-        raise TrustViolation(f"trusted path component is a symlink: {path!r}")
-    if not stat.S_ISDIR(st.st_mode):
-        raise TrustViolation(f"trusted path component is not a directory: {path!r}")
-    if st.st_uid != _TRUSTED_UID:
-        raise TrustViolation(
-            f"trusted path component is not owned by uid {_TRUSTED_UID}: {path!r}"
-        )
-    if _writable_by_others(st.st_mode):
-        raise TrustViolation(
-            f"trusted path component is group/world-writable: {path!r}"
-        )
-    return st
-
-
-def _check_final_component(path: str, *, executable: bool) -> os.stat_result:
-    """Validate the final (non-directory) component of a trusted path
-    chain: must exist, must not be a symlink, must be exactly a regular
-    file, owned by ``_TRUSTED_UID``, never group/world-writable, and (when
-    *executable*) owner-executable."""
-    try:
-        st = os.lstat(path)
-    except OSError as exc:
-        raise TrustViolation(f"cannot stat trusted path {path!r}: {exc}") from exc
-    if stat.S_ISLNK(st.st_mode):
-        raise TrustViolation(f"trusted path is a symlink: {path!r}")
-    if not stat.S_ISREG(st.st_mode):
-        raise TrustViolation(f"trusted path is not a regular file: {path!r}")
-    if st.st_uid != _TRUSTED_UID:
-        raise TrustViolation(
-            f"trusted path is not owned by uid {_TRUSTED_UID}: {path!r}"
-        )
-    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        raise TrustViolation(f"trusted path is group/world-writable: {path!r}")
-    if executable and not (st.st_mode & stat.S_IXUSR):
-        raise TrustViolation(f"trusted path is not owner-executable: {path!r}")
-    return st
-
-
-def _validate_trusted_path_chain(
-    path: str, *, executable: bool = False
-) -> Dict[str, Tuple[int, int, int, int, int]]:
-    """Validate every component of an absolute trusted *path* and return
-    an identity snapshot — ``{component: (dev, ino, mode, uid, gid)}`` —
-    for every parent directory plus the final component, so a caller can
-    re-check the exact same objects immediately before using the path.
-
-    Fail-closed on the first violation: a missing component, a symlink
-    anywhere in the chain, a parent that is not a real directory, a final
-    component that is not exactly a regular file, anything not owned by
-    ``_TRUSTED_UID`` (root), or anything writable by anyone but its owner
-    (sticky-bit directories excepted) all raise ``TrustViolation``.
-    """
-    if not os.path.isabs(path):
-        raise TrustViolation(f"trusted path is not absolute: {path!r}")
-
-    snapshot: Dict[str, Tuple[int, int, int, int, int]] = {}
-    for parent in _parent_dirs(path):
-        st = _check_dir_component(parent)
-        snapshot[parent] = _stat_identity(st)
-
-    final_st = _check_final_component(path, executable=executable)
-    snapshot[path] = _stat_identity(final_st)
-    return snapshot
-
-
-def _revalidate_trusted_path_chain(
-    snapshot: Dict[str, Tuple[int, int, int, int, int]],
-) -> None:
-    """Re-``lstat`` every component recorded in *snapshot* and compare its
-    full identity — device, inode, mode, uid, gid — against the value
-    captured at validation time. A component that vanished, was replaced
-    (even by another equally "valid" object — the inode differs), was
-    symlinked, or had its mode changed since validation raises
-    ``TrustViolation`` rather than trusting a path that may have moved
-    underneath the earlier check."""
-    for component, expected in snapshot.items():
-        try:
-            st = os.lstat(component)
-        except OSError as exc:
-            raise TrustViolation(
-                f"trusted path component vanished before use: {component!r}: {exc}"
-            ) from exc
-        if _stat_identity(st) != expected:
-            raise TrustViolation(
-                f"trusted path component identity changed before use: {component!r}"
-            )
+# The primitives themselves live in ``trust.py`` so ``project.py`` can
+# validate the git binary with the identical checks instead of growing a
+# second, subtly different copy. These module-level aliases keep every
+# existing internal call site — and every test that reaches for
+# ``runner.TrustViolation`` / ``runner._validate_trusted_path_chain`` —
+# working unchanged.
+TrustViolation = _trust.TrustViolation
+_TRUSTED_UID = _trust.TRUSTED_UID
+_parent_dirs = _trust.parent_dirs
+_stat_identity = _trust.stat_identity
+_writable_by_others = _trust.writable_by_others
+_check_dir_component = _trust.check_dir_component
+_check_final_component = _trust.check_final_component
+_validate_trusted_path_chain = _trust.validate_trusted_path_chain
+_revalidate_trusted_path_chain = _trust.revalidate_trusted_path_chain
 
 
 def _validate_docker_binary_trust() -> Dict[str, Tuple[int, int, int, int, int]]:
@@ -1158,11 +1077,14 @@ def spawn_claude(
     directory chain — snapshotted up front and re-validated twice more
     below — fails containment, identity, or symlink checks at any point
     before the subprocess actually runs (see ``snapshot_repo_cwd_chain`` /
-    ``_revalidate_repo_cwd_chain``). *repo_roots* should be the SAME
-    canonical roots the caller resolved *cwd* against (``_run_attempts``
-    passes ``policy.canonical_repo_roots(cfg)``); omitting it treats the
-    resolved cwd as its own sole allowed root, for callers that already
-    validated containment themselves.
+    ``_revalidate_repo_cwd_chain``).
+
+    *repo_roots* is an OPTIONAL extra containment constraint for a caller
+    that has already validated scope itself; it can only narrow. The normal
+    path (``run_worker``/``_run_attempts``) omits it entirely, so containment
+    and the ``/workspace`` mount source are both the one canonical Git
+    worktree root ``project.resolve_project_root_strict`` derives from *cwd*
+    — the same answer the gate gets, never a configured allowlist.
     """
     try:
         real_cwd, cwd_snapshot = snapshot_repo_cwd_chain(cwd, repo_roots)
@@ -1526,11 +1448,13 @@ def run_worker(
 
     Orchestrates requirements (1)/(2)/(4)/(6)/(9)/(10) in one call: cwd
     validation, breaker check (no spawn while open) with the explicit Terra
-    fallback, auto model routing, an isolated spawn capped structurally at
-    ``policy.MAX_ATTEMPTS``, evidence assembly, exactly one telemetry
-    record, and an advisory Terra review for substantial successful
-    changes. Returns a JSON string (the ``tools.registry.tool_result``
-    contract) — deterministic, no raw prompts/stdout embedded.
+    fallback, an OAuth credential freshness preflight (no spawn on a
+    credential we can already see is stale), auto model routing, an isolated
+    spawn capped structurally at ``policy.MAX_ATTEMPTS``, evidence assembly,
+    exactly one telemetry record, and an advisory Terra review for
+    substantial successful changes. Returns a JSON string (the
+    ``tools.registry.tool_result`` contract) — deterministic, no raw
+    prompts/stdout embedded.
 
     Every exit path — including an unexpected exception anywhere in the
     orchestration — goes through ``_finish``, which emits exactly one
@@ -1614,9 +1538,14 @@ def run_worker(
         if not isinstance(cwd_arg, str) or not cwd_arg.strip():
             return _failure("invalid_args", "cwd is required")
 
-        repo_roots = _policy.canonical_repo_roots(cfg)
+        # Scope is resolved dynamically from the request itself — the SAME
+        # ``project.py`` resolution the gate uses — not from a configured
+        # ``gate.repo_roots`` allowlist (which no longer has any authority;
+        # a stale key is parsed by the loader and never read). ``repo_roots``
+        # is therefore left unset here so every nested call re-derives the
+        # one canonical Git worktree root of this cwd.
         try:
-            resolved_cwd = validate_cwd(cwd_arg, repo_roots)
+            resolved_cwd = validate_cwd(cwd_arg)
         except CwdRejected as exc:
             return _failure("cwd_rejected", str(exc))
 
@@ -1627,14 +1556,26 @@ def run_worker(
                 allow_fallback=allow_fallback,
             ))
 
-        baseline_files = _git_changed_files(resolved_cwd, repo_roots=repo_roots)
+        # OAuth freshness, BEFORE any evidence gathering and before any
+        # docker/Claude spawn: a credential we can already see is stale must
+        # never be allowed to become an observed 401 that slams the ``auth``
+        # breaker shut for a full hour. This check is deliberately
+        # breaker-NEUTRAL — it never opens, clears, or resets any class (see
+        # ``oauth.py``), and a failure here is a HOLD, not a recorded failure.
+        auth_preflight = _oauth.preflight()
+        if not auth_preflight.get("ok"):
+            return _finish(_oauth_preflight_hold_payload(
+                auth_preflight, cwd=resolved_cwd, open_classes=open_classes_now,
+            ))
+
+        baseline_files = _git_changed_files(resolved_cwd)
         baseline_states = _snapshot_file_states(resolved_cwd, baseline_files)
 
         outcome = _run_attempts(
             task=task, cwd=resolved_cwd, complexity=complexity, cfg=cfg,
         )
 
-        after_files = _git_changed_files(resolved_cwd, repo_roots=repo_roots)
+        after_files = _git_changed_files(resolved_cwd)
         after_states = _snapshot_file_states(resolved_cwd, after_files)
         files_touched = _files_changed_since_baseline(
             baseline_files, baseline_states, after_files, after_states,
@@ -1686,6 +1627,85 @@ def run_worker(
                 "success": False, "status": "failed", "failure_class": "internal_error",
                 "error": _GENERIC_ERROR,
             })
+
+
+#: The failure class a failed OAuth freshness preflight reports. Deliberately
+#: NOT the ``auth`` breaker class: ``auth`` means the API actually rejected a
+#: request and a one-hour cooldown is now in force, while this means the local
+#: credential was inspected and found unusable before anything was spawned and
+#: NOTHING was opened. Keeping the string outside ``breaker.BREAKER_CLASSES``
+#: is also structural: no current or future "record the failure class" path
+#: can accidentally turn a preflight HOLD into a breaker cooldown.
+OAUTH_PREFLIGHT_FAILURE_CLASS = "auth_preflight"
+
+#: Canned, per-state operator text — a closed mapping over ``oauth``'s own
+#: state constants, never the preflight's free-text ``reason``. The state is
+#: provably non-secret (it is one of a handful of module literals); a reason
+#: string can quote whatever an operator-installed refresh probe put in its
+#: own error message, which ``oauth.redact`` can only scrub for the secrets
+#: currently in the credentials file. Nothing token-shaped can reach a result
+#: through a fixed literal.
+_OAUTH_HOLD_DETAIL: Dict[str, str] = {
+    _oauth.STATE_MISSING: "no Claude OAuth credentials file is readable on this host",
+    _oauth.STATE_MALFORMED: "the Claude OAuth credentials file is malformed or oversized",
+    _oauth.STATE_INVALID: "the Claude OAuth credentials file carries no usable OAuth material",
+    _oauth.STATE_EXPIRED: (
+        "the Claude OAuth access token is expired and carries no refresh token"
+    ),
+    _oauth.STATE_REFRESHABLE_EXPIRED: (
+        "the Claude OAuth access token is expired and could not be refreshed in isolation"
+    ),
+    _oauth.STATE_ERROR: "the Claude OAuth credential could not be checked",
+}
+
+
+def _oauth_preflight_hold_payload(
+    preflight_result: Dict[str, Any], cwd: str, open_classes: List[str],
+) -> Dict[str, Any]:
+    """Build the no-spawn HOLD result for a failed OAuth freshness preflight.
+
+    Structurally identical in its safety properties to
+    :func:`_breaker_open_payload` — ``attempts`` 0, no model, no exit code,
+    no touched files, and every fallback-provenance field pinned to the
+    locked values so ``gate._fallback_delivered`` can never read an unlock
+    out of it — but with two deliberate differences:
+
+    * ``breaker`` reports whatever the breaker ALREADY said (the empty
+      classes list the caller just read), because this path must not open,
+      clear, or reset any class. A stale credential is not an observed
+      rejection by the API, and burning an hour of cooldown on one would be
+      exactly the overreaction ``oauth.py`` exists to prevent.
+    * the only OAuth material that crosses into the result is the state name
+      and the ``refresh_attempted`` boolean. No token, no expiry instant, no
+      scope list, no raw credential JSON, and no free-text probe reason —
+      the operator-facing text is looked up from the closed
+      :data:`_OAUTH_HOLD_DETAIL` mapping by state.
+    """
+    state = preflight_result.get("state")
+    if not isinstance(state, str) or state not in _OAUTH_HOLD_DETAIL:
+        state = _oauth.STATE_ERROR
+    return {
+        "success": False,
+        "status": "HOLD",
+        "attempts": 0,
+        "escalated": False,
+        "failure_class": OAUTH_PREFLIGHT_FAILURE_CLASS,
+        "breaker": {"open": bool(open_classes), "classes": list(open_classes)},
+        "model": "", "route_reason": "", "exit_code": None,
+        "duration_ms": 0, "files_touched": [], "cwd": cwd,
+        "oauth_state": state,
+        "oauth_refresh_attempted": preflight_result.get("refresh_attempted") is True,
+        "fallback_ready": False,
+        "fallback_requested": False,
+        "fallback_provenance": None,
+        "fallback": None,
+        "error": (
+            f"claude_worker unavailable: {_OAUTH_HOLD_DETAIL[state]}. This session "
+            "remains on HOLD: direct edits stay gated. No worker was spawned and no "
+            "circuit breaker was opened — re-authenticate the host Claude Code "
+            "session and call claude_worker again."
+        ),
+    }
 
 
 def _breaker_open_payload(

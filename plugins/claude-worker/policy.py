@@ -2,74 +2,73 @@
 widen.
 
 Terra's review found every policy-critical value reachable from
-``plugins.entries.claude-worker``: canary channel ids, the platform, the
+``plugins.entries.claude-worker``: the in-scope chats, the platform, the
 gated tool set, the two model identities, and the escalation cap. A typo or
-a hostile edit in config.yaml could therefore gate a non-canary channel,
+a hostile edit in config.yaml could therefore gate an out-of-scope chat,
 swap Sonnet and Opus, or turn one escalation into an unbounded retry loop.
 
 This module is the single source of truth for those values, as module-level
 literals. It reads NO configuration of its own. The only thing configuration
-is allowed to do is *narrow*: disable the canary, or select a subset of the
-policy's channel ids (see :func:`enabled_canary_channel_ids`). Anything a
-caller passes that is not already inside the policy is discarded, never
-unioned in.
+is allowed to do is turn the whole feature OFF (see
+:func:`discord_scope_enabled`); it can never widen scope, and — since the
+policy is now "every Discord-origin session" — it can no longer narrow scope
+to a hand-picked list of channel ids either. The two hardcoded canary channel
+ids are gone: scope is the PLATFORM, not a channel allowlist.
 
-``canonical_repo_roots`` / ``resolve_within_roots`` live here for the same
-reason: the gate and the runner must share ONE root resolution, so the gate
-can never block a repository the worker is not permitted to run in (Terra's
-deadlock finding).
+Project scope is likewise no longer a static, configured list of repo roots.
+It is resolved dynamically, per request, from the canonical Git worktree root
+of the requested cwd — see ``project.py``, which the gate and the runner both
+call, so the gate can never block a repository the worker is not permitted to
+run in (Terra's deadlock finding). The literals that resolution depends on
+(the trusted git binary, its timeout, the system-sensitive roots that may
+never be a project root) live here.
 """
 
 from __future__ import annotations
 
-import os
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 # ---------------------------------------------------------------------------
-# Canary scope — exactly two Discord channels, forever
+# Discord scope — EVERY Discord-origin session, no channel allowlist
 # ---------------------------------------------------------------------------
 
-#: The only chats claude_worker gating may ever apply to. Threads are covered
-#: via their ``parent_chat_id`` (see ``canary.py``), not by adding thread ids.
-CANARY_CHANNEL_IDS = frozenset({
-    "1527706694665113670",
-    "1501268569697026140",
-})
-
-#: The only platform. A matching chat id on any other platform is not a canary.
-CANARY_PLATFORMS = frozenset({"discord"})
+#: The only platform claude_worker gating ever applies to. Every chat on it —
+#: guild channel, DM, and every thread under either — is in scope; threads are
+#: covered because the platform, not the chat id, is the test. A chat id on
+#: any other platform is never in scope.
+DISCORD_PLATFORMS = frozenset({"discord"})
 
 
-def is_canary_platform(platform: Any) -> bool:
+def is_discord_platform(platform: Any) -> bool:
     """True only for the exact literal platform value ``"discord"``."""
-    return isinstance(platform, str) and platform in CANARY_PLATFORMS
+    return isinstance(platform, str) and platform in DISCORD_PLATFORMS
 
 
-def enabled_canary_channel_ids(cfg: Optional[Dict[str, Any]]) -> frozenset:
-    """Return the policy channel ids currently in force.
+def discord_scope_enabled(cfg: Any) -> bool:
+    """Whether the Discord write gate is active at all.
 
-    Configuration may *disable* (``canary.enabled: false``) or *select a
-    subset* (``canary.channel_ids``); an id outside the policy is dropped
-    rather than added, and an absent/malformed selection means "all policy
-    channels" — the defaults activate the intended canary with no config at
-    all.
+    This is a GLOBAL kill switch and nothing more. Configuration may turn the
+    feature off entirely (``discord.enabled: false``, or the deprecated
+    ``canary.enabled: false``), which is safe because it can only ever remove
+    a restriction from *every* session at once — an operator cannot use it to
+    quietly exempt one channel while leaving the rest gated. There is
+    deliberately no channel selection: policy is ALL Discord, so any
+    ``channel_ids`` a stale config still carries is inert data that this
+    function never reads.
+
+    Only the literal ``False`` disables. A missing/malformed section, or a
+    truthy-looking string like ``"no"``, leaves the gate ON.
     """
-    canary_cfg = cfg.get("canary") if isinstance(cfg, dict) else None
-    if not isinstance(canary_cfg, dict):
-        return CANARY_CHANNEL_IDS
-
-    if canary_cfg.get("enabled", True) is False:
-        return frozenset()
-
-    selection = canary_cfg.get("channel_ids")
-    if not isinstance(selection, (list, tuple, set, frozenset)):
-        return CANARY_CHANNEL_IDS
-    if not selection:
-        return CANARY_CHANNEL_IDS
-
-    selected = {value for value in selection if isinstance(value, str)}
-    # Intersection, never union: config narrows the policy or does nothing.
-    return frozenset(selected & set(CANARY_CHANNEL_IDS))
+    if not isinstance(cfg, dict):
+        return True
+    section = cfg.get("discord")
+    if not isinstance(section, dict):
+        # Deprecated alias, accepted for backward compatibility with configs
+        # written while this feature was still a two-channel canary.
+        section = cfg.get("canary")
+    if not isinstance(section, dict):
+        return True
+    return section.get("enabled", True) is not False
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +88,15 @@ SKILL_MANAGE_MUTATING_ACTIONS = frozenset({
 
 # ---------------------------------------------------------------------------
 # Models and the structural attempt cap
+#
+# These two literals ARE the canonical claude_worker runtime — the model pair
+# the sandbox image, the routing rules, and the escalation cap were all proven
+# against. ``claude-sonnet-5`` is the default for every task;
+# ``claude-opus-5`` is used for an architecture / security / hard-debugging
+# classification, or for the single controlled escalation after one non-
+# breaker Sonnet failure. Nothing in this hardening pass changes either id,
+# and neither is reachable from configuration. (Hermes' own Sol/Terra/Grok
+# routing is a separate system and is untouched by this plugin.)
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODEL = "claude-sonnet-5"
@@ -197,55 +205,57 @@ MAX_CREDENTIAL_BYTES = 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
-# The one canonical repo-root resolution, shared by gate and runner
+# Dynamic project-root resolution literals (consumed by ``project.py``)
+#
+# There is no configured repo allowlist anymore. ``project.py`` resolves the
+# canonical Git worktree root of whatever cwd was requested and hands the
+# gate and the runner the SAME answer; these literals bound what that
+# resolution is allowed to accept and how it is allowed to ask git.
 # ---------------------------------------------------------------------------
 
+#: A fixed, absolute path — never a bare ``"git"`` resolved off the caller's
+#: ``$PATH``. ``project._git_toplevel`` additionally validates this exact
+#: path and every parent directory as non-symlink, root-owned, and never
+#: group/world-writable (``trust.validate_trusted_path_chain``) before it is
+#: ever executed, and refuses to consult git at all if that fails.
+GIT_BIN = "/usr/bin/git"
 
-def canonical_repo_roots(cfg: Optional[Dict[str, Any]]) -> List[str]:
-    """Resolve ``gate.repo_roots`` into a deduplicated list of real paths.
+#: Hard wall-clock bound on the one ``git rev-parse`` argv the resolver ever
+#: runs. Short on purpose: this is a local metadata read, not a network op.
+GIT_RESOLVE_TIMEOUT_SECONDS = 10
 
-    Symlinked, relative, trailing-slash, and duplicate entries all collapse
-    to one canonical form; entries that are not existing directories are
-    dropped. There is deliberately no ``.git``-ancestor fallback: scope is
-    exactly what the operator configured.
-    """
-    gate_cfg = cfg.get("gate") if isinstance(cfg, dict) else None
-    raw = gate_cfg.get("repo_roots") if isinstance(gate_cfg, dict) else None
-    if not isinstance(raw, (list, tuple)):
-        return []
+#: Longest ancestor walk the resolver will do looking for a ``.git`` marker.
+#: A real checkout is a handful of levels deep; this is a runaway backstop.
+MAX_PROJECT_WALK_DEPTH = 64
 
-    roots: List[str] = []
-    for entry in raw:
-        if not isinstance(entry, str) or not entry.strip():
-            continue
-        try:
-            real = os.path.realpath(entry)
-        except (OSError, ValueError):
-            continue
-        if not os.path.isdir(real):
-            continue
-        if real not in roots:
-            roots.append(real)
-    return roots
+#: Directories that may never themselves BE a project root, even if someone
+#: puts a ``.git`` in them. Mounting any of these would hand the sandbox a
+#: system directory, a whole home directory, or a parent holding many
+#: unrelated projects, instead of one repository.
+UNSAFE_PROJECT_ROOTS = frozenset({
+    "/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib32", "/lib64",
+    "/libx32", "/media", "/mnt", "/opt", "/proc", "/root", "/run", "/sbin",
+    "/srv", "/sys", "/tmp", "/usr", "/var",
+    # The worktree CONTAINER, never a project: mounting it would expose every
+    # sibling project to a worker asked to touch exactly one of them.
+    "/root/worktrees",
+})
+
+#: Prefixes under which nothing may ever be a project root, at any depth.
+UNSAFE_PROJECT_PREFIXES = (
+    "/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/libx32",
+    "/proc", "/run", "/sbin", "/sys", "/usr", "/var",
+)
 
 
-def resolve_within_roots(path: Any, roots: List[str]) -> Optional[str]:
-    """Return the canonical root *path* lives under, or ``None``.
+# ---------------------------------------------------------------------------
+# Terminal bypass — the canonical path to Claude is the claude_worker tool
+# ---------------------------------------------------------------------------
 
-    ``realpath`` runs BEFORE the containment check, so a symlink planted
-    inside a root that points outside it resolves out of scope instead of
-    smuggling access in. Containment is segment-wise, so ``/repo-evil`` is
-    not "inside" ``/repo``.
-    """
-    if not isinstance(path, str) or not path:
-        return None
-    try:
-        real = os.path.realpath(path)
-    except (OSError, ValueError):
-        return None
-    for root in roots or []:
-        if not isinstance(root, str) or not root:
-            continue
-        if real == root or real.startswith(root.rstrip(os.sep) + os.sep):
-            return root
-    return None
+#: Tools whose free-form command string could otherwise reach a host Claude
+#: CLI and route around the whole sandbox (see ``terminal_guard.py``).
+TERMINAL_TOOLS = frozenset({"terminal"})
+
+#: The executable basename that IS the Claude CLI. A token equal to this, or
+#: any path whose final component is this, is a direct invocation.
+CLAUDE_CLI_BASENAME = "claude"

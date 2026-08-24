@@ -22,7 +22,11 @@ from pathlib import Path
 
 import pytest
 
-from tests.plugins._claude_worker_helpers import load_submodule
+from tests.plugins._claude_worker_helpers import (
+    load_submodule,
+    make_git_repo,
+    require_safe_tmp,
+)
 
 runner = load_submodule("runner")
 policy = load_submodule("policy")
@@ -61,9 +65,15 @@ def _container_args(cmd):
 
 @pytest.fixture()
 def repo(tmp_path):
-    path = tmp_path / "repo"
-    path.mkdir()
-    return path
+    """A real Git worktree.
+
+    ``spawn_claude`` resolves its own scope through ``project.py`` whenever a
+    caller does not pass an explicit ``repo_roots`` (the dynamic
+    single-repository mount), so the fixture has to be something that
+    resolver accepts — a bare directory is not.
+    """
+    require_safe_tmp(tmp_path)
+    return make_git_repo(tmp_path, "repo")
 
 
 @pytest.fixture()

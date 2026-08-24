@@ -1,17 +1,19 @@
 """Tests for ``plugins/claude-worker/policy.py`` — the immutable policy layer.
 
 Every value Terra's review requires to be non-configurable lives here as a
-module-level literal: the two canary Discord channel ids, the platform, the
-mandatory gated tool set, the two model identities, the structural attempt
-cap, the sandbox image tag, and the Claude tool allowlist. These tests are
-the tripwire: they assert the literals themselves and that the helpers
-derived from them can never be widened by configuration.
+module-level literal: the in-scope PLATFORM (Discord, and every session on
+it — there is no channel allowlist any more), the mandatory gated tool set,
+the two model identities, the structural attempt cap, the sandbox image tag,
+the Claude tool allowlist, and the literals that bound the dynamic project-
+root resolver. These tests are the tripwire: they assert the literals
+themselves, that configuration can only turn the feature OFF, and that the
+retired channel/repo-root allowlists are gone rather than merely unused.
 """
 
 from __future__ import annotations
 
 import os
-import sys
+import re
 
 import pytest
 
@@ -19,48 +21,78 @@ from tests.plugins._claude_worker_helpers import load_submodule
 
 policy = load_submodule("policy")
 
-CHANNEL_A = "1527706694665113670"
-CHANNEL_B = "1501268569697026140"
 
-
-class TestImmutableCanaryPolicy:
-    def test_exact_channel_ids(self):
-        assert set(policy.CANARY_CHANNEL_IDS) == {CHANNEL_A, CHANNEL_B}
-
+class TestGlobalDiscordScope:
     def test_platform_is_discord_only(self):
-        assert policy.CANARY_PLATFORMS == frozenset({"discord"})
+        assert policy.DISCORD_PLATFORMS == frozenset({"discord"})
 
-    def test_channel_ids_are_an_immutable_container(self):
-        assert isinstance(policy.CANARY_CHANNEL_IDS, frozenset)
+    def test_platform_set_is_an_immutable_container(self):
+        assert isinstance(policy.DISCORD_PLATFORMS, frozenset)
         with pytest.raises(AttributeError):
-            policy.CANARY_CHANNEL_IDS.add("999")
+            policy.DISCORD_PLATFORMS.add("telegram")
 
-    def test_config_cannot_add_channels(self):
-        cfg = {"canary": {"enabled": True, "channel_ids": ["999999999999999999", CHANNEL_A]}}
-        assert policy.enabled_canary_channel_ids(cfg) == frozenset({CHANNEL_A})
+    def test_platform_check_accepts_only_the_exact_literal(self):
+        assert policy.is_discord_platform("discord") is True
+        for bad in ("telegram", "slack", "cli", "", None, 7, [], "Discord", "DISCORD", "discord "):
+            assert policy.is_discord_platform(bad) is False
 
-    def test_config_may_select_a_subset(self):
-        cfg = {"canary": {"enabled": True, "channel_ids": [CHANNEL_B]}}
-        assert policy.enabled_canary_channel_ids(cfg) == frozenset({CHANNEL_B})
+    def test_channel_allowlist_helpers_are_gone_not_merely_unused(self):
+        """A dormant narrowing helper is a narrowing helper: if it still
+        existed, a future caller could reintroduce per-channel scope."""
+        for removed in ("CANARY_CHANNEL_IDS", "CANARY_PLATFORMS",
+                        "enabled_canary_channel_ids", "is_canary_platform"):
+            assert not hasattr(policy, removed)
 
-    def test_empty_selection_means_all_policy_channels(self):
-        cfg = {"canary": {"enabled": True, "channel_ids": []}}
-        assert policy.enabled_canary_channel_ids(cfg) == policy.CANARY_CHANNEL_IDS
+    def test_module_contains_no_channel_id_literals(self):
+        source = open(policy.__file__, encoding="utf-8").read()
+        assert re.search(r"\d{17,20}", source) is None
 
-    def test_feature_can_be_disabled_but_not_widened(self):
-        cfg = {"canary": {"enabled": False, "channel_ids": ["999"]}}
-        assert policy.enabled_canary_channel_ids(cfg) == frozenset()
 
-    def test_malformed_canary_config_is_safe(self):
-        for cfg in ({}, {"canary": None}, {"canary": {"channel_ids": "1527706694665113670"}},
-                    {"canary": {"channel_ids": [None, 5, {}]}}):
-            result = policy.enabled_canary_channel_ids(cfg)
-            assert result <= policy.CANARY_CHANNEL_IDS
+class TestKillSwitchIsTheOnlyKnob:
+    @pytest.mark.parametrize(
+        "cfg",
+        [
+            {},
+            {"discord": {}},
+            {"discord": {"enabled": True}},
+            {"canary": {"enabled": True}},
+            {"discord": None},
+            {"canary": None},
+            {"discord": "nonsense"},
+            {"canary": {"channel_ids": ["1527706694665113670"]}},
+        ],
+    )
+    def test_gate_stays_on_by_default_and_for_malformed_config(self, cfg):
+        assert policy.discord_scope_enabled(cfg) is True
 
-    def test_platform_check_rejects_non_discord(self):
-        assert policy.is_canary_platform("discord") is True
-        for bad in ("telegram", "slack", "cli", "", None, "Discord "):
-            assert policy.is_canary_platform(bad) is False
+    def test_only_the_literal_false_disables(self):
+        assert policy.discord_scope_enabled({"discord": {"enabled": False}}) is False
+        assert policy.discord_scope_enabled({"canary": {"enabled": False}}) is False
+
+    @pytest.mark.parametrize("truthy_looking", ["no", "false", "0", 0, [], None])
+    def test_a_non_bool_never_reads_as_off(self, truthy_looking):
+        """For a safety toggle, a mistyped value must not silently disable
+        the gate."""
+        assert policy.discord_scope_enabled({"discord": {"enabled": truthy_looking}}) is True
+
+    def test_discord_section_wins_over_the_deprecated_alias(self):
+        cfg = {"discord": {"enabled": False}, "canary": {"enabled": True}}
+        assert policy.discord_scope_enabled(cfg) is False
+
+    def test_non_dict_config_leaves_the_gate_on(self):
+        for cfg in (None, "off", 0, []):
+            assert policy.discord_scope_enabled(cfg) is True
+
+    def test_config_cannot_narrow_scope_to_channels(self):
+        """The one remaining knob is global. There is no shape of config that
+        turns the gate on for one channel and off for another — every call
+        below returns the SAME answer for the whole platform."""
+        for cfg in (
+            {"discord": {"enabled": True, "channel_ids": ["1"]}},
+            {"canary": {"enabled": True, "channel_ids": ["1"]}},
+            {"canary": {"enabled": True, "channel_ids": []}},
+        ):
+            assert policy.discord_scope_enabled(cfg) is True
 
 
 class TestImmutableGateToolSet:
@@ -167,73 +199,64 @@ class TestCredentialStagingPolicy:
         assert policy.MAX_CREDENTIAL_BYTES == 1024 * 1024
 
 
-class TestCanonicalRepoRoots:
-    def test_roots_are_resolved_and_deduplicated(self, tmp_path):
-        root = tmp_path / "repo"
-        root.mkdir()
-        cfg = {"gate": {"repo_roots": [str(root), str(root) + os.sep, str(root)]}}
-        roots = policy.canonical_repo_roots(cfg)
-        assert roots == [os.path.realpath(str(root))]
+class TestNoStaticRepoRootAuthorityRemains:
+    """``gate.repo_roots`` used to be BOTH the authority for where the worker
+    could run AND the thing that got mounted, which is how an operator entry
+    of ``/root/worktrees`` handed every container every sibling checkout.
+    Project scope is resolved dynamically now (``project.py``), so the
+    configured-allowlist helpers must be gone, not dormant."""
 
-    def test_missing_roots_are_dropped(self, tmp_path):
-        root = tmp_path / "repo"
-        root.mkdir()
-        cfg = {"gate": {"repo_roots": [str(root), str(tmp_path / "nope"), None, 7]}}
-        assert policy.canonical_repo_roots(cfg) == [os.path.realpath(str(root))]
+    def test_configured_root_helpers_are_gone(self):
+        for removed in ("canonical_repo_roots", "resolve_within_roots"):
+            assert not hasattr(policy, removed)
 
-    def test_no_roots_configured_means_empty(self):
-        assert policy.canonical_repo_roots({}) == []
-        assert policy.canonical_repo_roots({"gate": {"repo_roots": []}}) == []
+    def test_policy_never_reads_a_repo_roots_config_key(self):
+        source = open(policy.__file__, encoding="utf-8").read()
+        for config_key in ('"repo_roots"', "'repo_roots'", '.get("gate")', ".get('gate')"):
+            assert config_key not in source
 
-    def test_resolve_within_roots_accepts_nested_path(self, tmp_path):
-        root = tmp_path / "repo"
-        (root / "src").mkdir(parents=True)
-        target = root / "src" / "app.py"
-        target.write_text("x = 1\n", encoding="utf-8")
-        roots = [os.path.realpath(str(root))]
-        assert policy.resolve_within_roots(str(target), roots) == os.path.realpath(str(root))
 
-    def test_resolve_within_roots_rejects_outside(self, tmp_path):
-        root = tmp_path / "repo"
-        root.mkdir()
-        other = tmp_path / "other"
-        other.mkdir()
-        roots = [os.path.realpath(str(root))]
-        assert policy.resolve_within_roots(str(other / "f.py"), roots) is None
+class TestDynamicResolverLiterals:
+    """The literals ``project.py``'s resolution is bounded by. They are
+    policy, not configuration, for the same reason the model ids are."""
 
-    def test_resolve_within_roots_rejects_sibling_prefix_collision(self, tmp_path):
-        root = tmp_path / "repo"
-        root.mkdir()
-        sibling = tmp_path / "repo-evil"
-        sibling.mkdir()
-        roots = [os.path.realpath(str(root))]
-        assert policy.resolve_within_roots(str(sibling / "f.py"), roots) is None
+    def test_git_bin_is_an_absolute_trusted_path_not_a_bare_command(self):
+        assert policy.GIT_BIN == "/usr/bin/git"
+        assert os.path.isabs(policy.GIT_BIN)
+        assert "/" in policy.GIT_BIN
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks need admin on Windows")
-    def test_resolve_within_roots_is_symlink_safe(self, tmp_path):
-        root = tmp_path / "repo"
-        root.mkdir()
-        outside = tmp_path / "secret"
-        outside.mkdir()
-        (outside / "creds.txt").write_text("token\n", encoding="utf-8")
-        link = root / "escape"
-        link.symlink_to(outside, target_is_directory=True)
-        roots = [os.path.realpath(str(root))]
-        assert policy.resolve_within_roots(str(link / "creds.txt"), roots) is None
+    def test_git_resolution_timeout_is_bounded_and_short(self):
+        assert isinstance(policy.GIT_RESOLVE_TIMEOUT_SECONDS, int)
+        assert 0 < policy.GIT_RESOLVE_TIMEOUT_SECONDS <= 30
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks need admin on Windows")
-    def test_symlinked_root_itself_is_canonicalized(self, tmp_path):
-        real = tmp_path / "real-repo"
-        real.mkdir()
-        link = tmp_path / "linked-repo"
-        link.symlink_to(real, target_is_directory=True)
-        cfg = {"gate": {"repo_roots": [str(link)]}}
-        roots = policy.canonical_repo_roots(cfg)
-        assert roots == [os.path.realpath(str(real))]
-        assert policy.resolve_within_roots(str(real / "a.py"), roots) == os.path.realpath(str(real))
+    def test_ancestor_walk_depth_is_bounded(self):
+        assert isinstance(policy.MAX_PROJECT_WALK_DEPTH, int)
+        assert 0 < policy.MAX_PROJECT_WALK_DEPTH <= 256
 
-    def test_dotdot_traversal_is_rejected(self, tmp_path):
-        root = tmp_path / "repo"
-        root.mkdir()
-        roots = [os.path.realpath(str(root))]
-        assert policy.resolve_within_roots(str(root / ".." / "etc" / "passwd"), roots) is None
+    @pytest.mark.parametrize(
+        "sensitive",
+        ["/", "/etc", "/usr", "/var", "/proc", "/sys", "/dev", "/root", "/home", "/tmp", "/run"],
+    )
+    def test_system_sensitive_directories_can_never_be_a_project_root(self, sensitive):
+        assert sensitive in policy.UNSAFE_PROJECT_ROOTS
+
+    def test_the_multi_project_worktree_container_is_never_a_project_root(self):
+        assert "/root/worktrees" in policy.UNSAFE_PROJECT_ROOTS
+
+    def test_unsafe_prefixes_cover_the_system_trees_at_any_depth(self):
+        for prefix in ("/etc", "/usr", "/var", "/proc", "/sys", "/dev", "/run", "/bin", "/sbin"):
+            assert prefix in policy.UNSAFE_PROJECT_PREFIXES
+
+    def test_unsafe_containers_are_immutable(self):
+        assert isinstance(policy.UNSAFE_PROJECT_ROOTS, frozenset)
+        assert isinstance(policy.UNSAFE_PROJECT_PREFIXES, tuple)
+        with pytest.raises(AttributeError):
+            policy.UNSAFE_PROJECT_ROOTS.add("/anything")
+
+
+class TestTerminalBypassPolicy:
+    def test_terminal_tool_is_in_scope_for_the_guard(self):
+        assert policy.TERMINAL_TOOLS == frozenset({"terminal"})
+
+    def test_claude_cli_basename_is_the_exact_executable_name(self):
+        assert policy.CLAUDE_CLI_BASENAME == "claude"

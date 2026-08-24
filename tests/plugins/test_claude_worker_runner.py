@@ -9,34 +9,69 @@ counting on a mocked ``spawn_claude``. The container command shape itself
 ``test_claude_worker_isolation.py``; ``spawn_claude`` is mocked here at the
 orchestration boundary — it never spawns a host ``claude`` process, only the
 locked-down ``docker run`` sandbox.
+
+``run_worker`` also runs an OAuth credential freshness preflight before it
+commits to a spawn, and the fixed host credentials path it reads does not
+exist under a test home. The autouse fixture below therefore defaults every
+test in this module to a healthy credential; ``TestOAuthPreflightIntegration``
+at the bottom restores the production implementation and drives it against a
+real temporary credentials file.
+
+Every ``repo`` here is a real Git worktree (``make_git_repo``) because scope
+is resolved dynamically now: ``run_worker`` validates its cwd through
+``project.resolve_project_root_strict``, the same resolver the gate uses, and
+refuses anything that is not inside a real worktree. The retired
+``gate.repo_roots`` key is still accepted by the loader and is deliberately
+still passed in some configs below — to prove it grants nothing.
 """
 
 from __future__ import annotations
 
 import json
 import subprocess
+import time
 
 import pytest
 
-from tests.plugins._claude_worker_helpers import load_submodule
+from tests.plugins._claude_worker_helpers import (
+    load_submodule,
+    make_git_repo,
+    require_safe_tmp,
+    stub_fresh_oauth_preflight,
+    write_credentials,
+)
 
 runner = load_submodule("runner")
 breaker = load_submodule("breaker")
 telemetry = load_submodule("telemetry")
 config = load_submodule("config")
 policy = load_submodule("policy")
+oauth = load_submodule("oauth")
+
+#: Captured at import time, before any fixture stubs it, so the tests that are
+#: ABOUT the preflight can restore the production implementation.
+_REAL_OAUTH_PREFLIGHT = oauth.preflight
 
 
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):
+    require_safe_tmp(tmp_path)
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     runner.reset_preflight_cache()
+    # ``run_worker`` now refuses to spawn on a credential it can already see
+    # is stale. The fixed host credentials path does not exist under a test
+    # home, so default every test in this module to a healthy credential;
+    # ``TestOAuthPreflightIntegration`` below overrides this deliberately.
+    stub_fresh_oauth_preflight(monkeypatch)
     yield
 
 
 def _cfg_with_roots(*roots, **overrides):
+    """Build a plugin config carrying the DEPRECATED, inert ``gate.repo_roots``
+    key. It is kept in these tests deliberately: every call below must behave
+    identically whether or not the requested cwd appears in it."""
     entry = {"gate": {"repo_roots": [str(r) for r in roots]}}
     entry.update(overrides)
     return {"plugins": {"entries": {"claude-worker": entry}}}
@@ -57,8 +92,7 @@ class TestSpawnIsInvokedWithoutLegacyHostArgs:
     policy literals baked into ``build_claude_docker_command`` instead."""
 
     def test_run_worker_calls_spawn_claude_with_only_the_sandboxed_kwargs(self, tmp_path, monkeypatch):
-        repo = tmp_path / "repo"
-        repo.mkdir()
+        repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
 
         calls = []
@@ -129,8 +163,7 @@ class TestGitChangedFiles:
         }
 
     def test_real_git_repo_reports_changed_files(self, tmp_path, monkeypatch):
-        repo = tmp_path / "repo"
-        repo.mkdir()
+        repo = make_git_repo(tmp_path, "repo")
         subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
         subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo, check=True)
         subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
@@ -216,8 +249,7 @@ class TestGitChangedFiles:
 
 class TestRunWorkerSuccess:
     def test_sonnet_success_returns_full_evidence(self, tmp_path, monkeypatch):
-        repo = tmp_path / "repo"
-        repo.mkdir()
+        repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
 
         calls = []
@@ -257,8 +289,7 @@ class TestRunWorkerSuccess:
     def test_preexisting_dirty_file_unchanged_by_worker_is_not_attributed(
         self, tmp_path, monkeypatch,
     ):
-        repo = tmp_path / "repo"
-        repo.mkdir()
+        repo = make_git_repo(tmp_path, "repo")
         dirty = repo / "dirty.py"
         dirty.write_text("already dirty\n")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
@@ -290,8 +321,7 @@ class TestRunWorkerSuccess:
     def test_preexisting_dirty_file_modified_by_worker_is_attributed(
         self, tmp_path, monkeypatch,
     ):
-        repo = tmp_path / "repo"
-        repo.mkdir()
+        repo = make_git_repo(tmp_path, "repo")
         dirty = repo / "dirty.py"
         dirty.write_text("already dirty\n")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
@@ -321,8 +351,7 @@ class TestRunWorkerSuccess:
 
 class TestRunWorkerBreakerOpen:
     def test_breaker_open_refuses_without_spawning(self, tmp_path, monkeypatch):
-        repo = tmp_path / "repo"
-        repo.mkdir()
+        repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
         breaker.record_failure("auth", {"auth": 3600})
 
@@ -342,8 +371,7 @@ class TestRunWorkerBreakerOpen:
 
 class TestRunWorkerEscalation:
     def test_sonnet_failure_escalates_once_to_opus_success(self, tmp_path, monkeypatch):
-        repo = tmp_path / "repo"
-        repo.mkdir()
+        repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
 
         calls = []
@@ -369,8 +397,7 @@ class TestRunWorkerEscalation:
         assert result["model"] == "claude-opus-5"
 
     def test_escalation_uses_only_remaining_total_budget(self, tmp_path, monkeypatch):
-        repo = tmp_path / "repo"
-        repo.mkdir()
+        repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(
             config, "_load_raw_config",
             lambda: _cfg_with_roots(repo, isolation={"timeout_seconds": 900}),
@@ -402,8 +429,7 @@ class TestRunWorkerEscalation:
         ]
 
     def test_no_third_spawn_after_two_failures(self, tmp_path, monkeypatch):
-        repo = tmp_path / "repo"
-        repo.mkdir()
+        repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
 
         calls = []
@@ -423,8 +449,7 @@ class TestRunWorkerEscalation:
         assert result["escalated"] is True
 
     def test_auth_failure_opens_breaker_and_does_not_escalate(self, tmp_path, monkeypatch):
-        repo = tmp_path / "repo"
-        repo.mkdir()
+        repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
 
         calls = []
@@ -449,8 +474,7 @@ class TestRunWorkerEscalation:
         and the real failure in stdout, e.g. an expired OAuth token. That must
         classify as ``auth`` (one attempt, breaker opens, no Opus escalation),
         not ``other`` (which would retry on Opus)."""
-        repo = tmp_path / "repo"
-        repo.mkdir()
+        repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
 
         calls = []
@@ -485,8 +509,7 @@ class TestRunWorkerEscalation:
         """Non-JSON/garbled stdout must never raise and must not be
         misclassified as auth — it should behave exactly like the existing
         generic-failure path (escalate once to Opus)."""
-        repo = tmp_path / "repo"
-        repo.mkdir()
+        repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
 
         calls = []
@@ -510,30 +533,103 @@ class TestRunWorkerEscalation:
 
 
 class TestRunWorkerCwdRejection:
-    def test_cwd_outside_repo_roots_refuses_without_spawning(self, tmp_path, monkeypatch):
-        repo = tmp_path / "repo"
-        repo.mkdir()
-        outside = tmp_path / "outside"
-        outside.mkdir()
-        monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
+    """Scope comes from the request, resolved by ``project.py`` — the SAME
+    resolver the gate consults, so the runner can never refuse a repository
+    the gate is busy gating (Terra's deadlock finding)."""
 
+    def _refuse(self, monkeypatch, cwd, session_id):
         def _must_not_spawn(**kwargs):
             raise AssertionError("spawn_claude must not be called for a rejected cwd")
 
         monkeypatch.setattr(runner, "spawn_claude", _must_not_spawn)
+        return json.loads(runner.run_worker({"task": "fix it", "cwd": cwd}, session_id=session_id))
 
-        raw = runner.run_worker({"task": "fix it", "cwd": str(outside)}, session_id="sess:6")
-        result = json.loads(raw)
+    def test_cwd_outside_any_git_worktree_refuses_without_spawning(self, tmp_path, monkeypatch):
+        repo = make_git_repo(tmp_path, "repo")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
 
+        result = self._refuse(monkeypatch, str(outside), "sess:cwd-outside")
         assert result["success"] is False
         assert result["attempts"] == 0
         assert result["failure_class"] == "cwd_rejected"
 
+    def test_a_configured_repo_root_cannot_authorise_a_non_git_cwd(self, tmp_path, monkeypatch):
+        """The deprecated key is inert in BOTH directions: naming a directory
+        in ``gate.repo_roots`` does not make it a valid worker cwd."""
+        outside = tmp_path / "configured-but-not-a-repo"
+        outside.mkdir()
+        monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(outside))
+
+        result = self._refuse(monkeypatch, str(outside), "sess:cwd-configured-non-git")
+        assert result["failure_class"] == "cwd_rejected"
+
+    def test_an_unconfigured_git_repo_is_accepted(self, tmp_path, monkeypatch):
+        """...and inert in the other direction too: a brand-new checkout that
+        appears in no config at all is a perfectly valid worker cwd."""
+        fresh = make_git_repo(tmp_path, "brand-new")
+        monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots())
+        monkeypatch.setattr(
+            runner, "spawn_claude",
+            lambda **kw: _spawn_result(exit_code=0, stdout=json.dumps({"result": "ok"}), model=kw["model"]),
+        )
+        monkeypatch.setattr(runner, "_git_changed_files", lambda cwd, repo_roots=None: [])
+
+        result = json.loads(runner.run_worker(
+            {"task": "fix it", "cwd": str(fresh)}, session_id="sess:cwd-unconfigured",
+        ))
+        assert result["success"] is True
+        assert result["cwd"] == str(fresh.resolve())
+
+    def test_a_relative_cwd_refuses_without_spawning(self, tmp_path, monkeypatch):
+        make_git_repo(tmp_path, "repo")
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(config, "_load_raw_config", lambda: {})
+
+        result = self._refuse(monkeypatch, "repo", "sess:cwd-relative")
+        assert result["failure_class"] == "cwd_rejected"
+
+    def test_a_nested_cwd_resolves_to_its_repo_root(self, tmp_path, monkeypatch):
+        repo = make_git_repo(tmp_path, "repo")
+        nested = repo / "src"
+        nested.mkdir()
+        monkeypatch.setattr(config, "_load_raw_config", lambda: {})
+        monkeypatch.setattr(
+            runner, "spawn_claude",
+            lambda **kw: _spawn_result(exit_code=0, stdout=json.dumps({"result": "ok"}), model=kw["model"]),
+        )
+        monkeypatch.setattr(runner, "_git_changed_files", lambda cwd, repo_roots=None: [])
+
+        result = json.loads(runner.run_worker(
+            {"task": "fix it", "cwd": str(nested)}, session_id="sess:cwd-nested",
+        ))
+        assert result["success"] is True
+        # The worker still RUNS in the nested directory; what gets mounted is
+        # the repository root (asserted in test_claude_worker_isolation.py).
+        assert result["cwd"] == str(nested.resolve())
+
+    def test_a_symlink_escaping_the_repo_is_judged_where_it_lands(self, tmp_path, monkeypatch):
+        repo = make_git_repo(tmp_path, "repo")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (repo / "escape").symlink_to(outside, target_is_directory=True)
+        monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
+
+        result = self._refuse(monkeypatch, str(repo / "escape"), "sess:cwd-symlink-escape")
+        assert result["failure_class"] == "cwd_rejected"
+
+    def test_run_worker_never_asks_policy_for_configured_roots(self):
+        """The tripwire: ``run_worker`` used to call a policy helper that
+        turned ``gate.repo_roots`` into the worker's authority."""
+        source = open(runner.__file__, encoding="utf-8").read()
+        assert "canonical_repo_roots" not in source
+        assert "resolve_within_roots" not in source
+
 
 class TestTelemetryIntegration:
     def test_exactly_one_telemetry_record_per_invocation(self, tmp_path, monkeypatch):
-        repo = tmp_path / "repo"
-        repo.mkdir()
+        repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
 
         calls = []
@@ -556,8 +652,7 @@ class TestTelemetryIntegration:
         assert telemetry_calls[0]["session_id"] == "sess:7"
 
     def test_telemetry_emitted_even_when_breaker_open(self, tmp_path, monkeypatch):
-        repo = tmp_path / "repo"
-        repo.mkdir()
+        repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
         breaker.record_failure("rate", {"rate": 900})
 
@@ -573,8 +668,7 @@ class TestTelemetryIntegration:
 
 class TestReviewIntegration:
     def test_review_runs_for_substantial_success(self, tmp_path, monkeypatch):
-        repo = tmp_path / "repo"
-        repo.mkdir()
+        repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(
             config, "_load_raw_config",
             lambda: _cfg_with_roots(repo, review={"enabled": True, "min_changed_files": 2}),
@@ -602,8 +696,7 @@ class TestReviewIntegration:
         assert result["review"]["reviewed"] is True
 
     def test_review_skipped_below_threshold(self, tmp_path, monkeypatch):
-        repo = tmp_path / "repo"
-        repo.mkdir()
+        repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(
             config, "_load_raw_config",
             lambda: _cfg_with_roots(repo, review={"enabled": True, "min_changed_files": 5}),
@@ -628,8 +721,7 @@ class TestReviewIntegration:
         assert result["review"] is None
 
     def test_review_failure_does_not_fail_worker_result(self, tmp_path, monkeypatch):
-        repo = tmp_path / "repo"
-        repo.mkdir()
+        repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(
             config, "_load_raw_config",
             lambda: _cfg_with_roots(repo, review={"enabled": True, "min_changed_files": 1}),
@@ -656,8 +748,7 @@ class TestReviewIntegration:
 
 class TestInputValidation:
     def test_missing_task_is_rejected_without_spawning(self, tmp_path, monkeypatch):
-        repo = tmp_path / "repo"
-        repo.mkdir()
+        repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
 
         def _must_not_spawn(**kwargs):
@@ -687,8 +778,7 @@ class TestFallbackConsentStrictness:
         ids=["False", "str-false", "str-true", "int-0", "int-1", "empty-list", "empty-dict", "None"],
     )
     def test_non_true_allow_terra_fallback_never_invokes_fallback(self, tmp_path, monkeypatch, bad_value):
-        repo = tmp_path / "repo"
-        repo.mkdir()
+        repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
         breaker.record_failure("auth", {"auth": 3600})
 
@@ -709,8 +799,7 @@ class TestFallbackConsentStrictness:
         assert result["status"] == "HOLD"
 
     def test_missing_allow_terra_fallback_key_never_invokes_fallback(self, tmp_path, monkeypatch):
-        repo = tmp_path / "repo"
-        repo.mkdir()
+        repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
         breaker.record_failure("auth", {"auth": 3600})
 
@@ -728,8 +817,7 @@ class TestFallbackConsentStrictness:
         assert result["status"] == "HOLD"
 
     def test_literal_true_invokes_fallback_and_marks_ready_with_provenance(self, tmp_path, monkeypatch):
-        repo = tmp_path / "repo"
-        repo.mkdir()
+        repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
         breaker.record_failure("auth", {"auth": 3600})
 
@@ -755,8 +843,7 @@ class TestFallbackConsentStrictness:
         assert result["fallback"]["notes"] == "Terra guidance"
 
     def test_failed_terra_fallback_still_holds_without_fallback_ready(self, tmp_path, monkeypatch):
-        repo = tmp_path / "repo"
-        repo.mkdir()
+        repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
         breaker.record_failure("auth", {"auth": 3600})
 
@@ -783,8 +870,7 @@ class TestSessionEnvLookupSafety:
     out of tool dispatch."""
 
     def test_session_key_lookup_failure_yields_one_redacted_internal_error(self, tmp_path, monkeypatch):
-        repo = tmp_path / "repo"
-        repo.mkdir()
+        repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
 
         def _boom(name, default=""):
@@ -814,8 +900,7 @@ class TestSessionEnvLookupSafety:
         assert len(telemetry_calls) == 1
 
     def test_chat_id_lookup_failure_yields_one_redacted_internal_error(self, tmp_path, monkeypatch):
-        repo = tmp_path / "repo"
-        repo.mkdir()
+        repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
 
         def _boom(name, default=""):
@@ -859,8 +944,7 @@ class TestUnexpectedSpawnException:
     into one redacted failure result and exactly one telemetry record."""
 
     def test_run_worker_degrades_to_one_internal_error_result(self, tmp_path, monkeypatch):
-        repo = tmp_path / "repo"
-        repo.mkdir()
+        repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
 
         def _boom(**kwargs):
@@ -885,3 +969,352 @@ class TestUnexpectedSpawnException:
         raw = runner.run_worker({"task": "fix it"}, session_id="sess:13")
         result = json.loads(raw)
         assert result["success"] is False
+
+
+class TestOAuthPreflightIntegration:
+    """``run_worker`` must check OAuth credential freshness BEFORE it commits
+    to a spawn — that is the whole point of ``oauth.py``: a credential we can
+    already see is stale must never become an observed 401 that slams the
+    ``auth`` breaker shut for an hour while every session sits on HOLD.
+
+    These tests deliberately let the REAL ``oauth.preflight`` run, against a
+    temporary credentials file that ``policy.HOST_CREDENTIALS_PATH`` is
+    pointed at, so they prove the wiring rather than a stub's return value.
+    ``spawn_claude`` is still mocked at the orchestration boundary, so the
+    fixed host path is never actually mounted or read by the docker layer.
+    """
+
+    # ``_isolated`` is requested explicitly, not merely relied on: it is the
+    # fixture that installs the module-wide fresh-preflight stub, and this
+    # one has to undo it, so the ordering must be a dependency rather than an
+    # assumption about how pytest sequences two autouse fixtures.
+    @pytest.fixture(autouse=True)
+    def _real_preflight(self, _isolated, tmp_path, monkeypatch):
+        """Undo the module-wide fresh-preflight stub and point the fixed host
+        credentials path at a temporary file, so every case below exercises
+        the production implementation.
+
+        The clock is deliberately NOT patched — ``time.time`` is a globally
+        shared module attribute that ``breaker`` reads too. Every expiry
+        below is instead written far from ``oauth.FRESHNESS_MARGIN_SECONDS``
+        (an hour ahead, or ten seconds behind), so the outcome does not
+        depend on how long the test itself takes. The margin boundary itself
+        is pinned exactly, with an explicit ``now``, in
+        ``test_claude_worker_oauth.py``.
+        """
+        monkeypatch.setattr(oauth, "preflight", _REAL_OAUTH_PREFLIGHT)
+        monkeypatch.setattr(oauth, "REFRESH_PROBE", None)
+        self.now = time.time()
+        self.creds = tmp_path / "creds" / ".credentials.json"
+        monkeypatch.setattr(policy, "HOST_CREDENTIALS_PATH", str(self.creds))
+
+    def _repo(self, tmp_path, monkeypatch):
+        repo = make_git_repo(tmp_path, "repo")
+        monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
+        return repo
+
+    def _no_spawn(self, monkeypatch):
+        def _must_not_spawn(**kwargs):
+            raise AssertionError("spawn_claude must not be called after a preflight HOLD")
+
+        def _must_not_attempt(**kwargs):
+            raise AssertionError("_run_attempts must not be called after a preflight HOLD")
+
+        monkeypatch.setattr(runner, "spawn_claude", _must_not_spawn)
+        monkeypatch.setattr(runner, "_run_attempts", _must_not_attempt)
+
+    def _spawns(self, monkeypatch):
+        calls = []
+
+        def _fake_spawn(**kwargs):
+            calls.append(kwargs)
+            return _spawn_result(
+                exit_code=0, stdout=json.dumps({"result": "done"}), model=kwargs["model"],
+            )
+
+        monkeypatch.setattr(runner, "spawn_claude", _fake_spawn)
+        monkeypatch.setattr(runner, "_git_changed_files", lambda cwd, repo_roots=None: [])
+        return calls
+
+    # -- fresh credential proceeds -----------------------------------------
+
+    def test_fresh_credential_proceeds_to_exactly_one_attempt(self, tmp_path, monkeypatch):
+        repo = self._repo(tmp_path, monkeypatch)
+        write_credentials(self.creds, expires_at=(self.now + 3600) * 1000)
+        calls = self._spawns(monkeypatch)
+
+        result = json.loads(runner.run_worker(
+            {"task": "fix it", "cwd": str(repo)}, session_id="sess:oauth-fresh",
+        ))
+
+        assert len(calls) == 1
+        assert result["success"] is True
+        assert result["attempts"] == 1
+        assert "oauth_state" not in result  # nothing extra on the happy path
+
+    # -- failed preflight HOLDs, spawns nothing, touches no breaker --------
+
+    def test_missing_credential_holds_without_spawning_or_touching_breaker(
+        self, tmp_path, monkeypatch,
+    ):
+        repo = self._repo(tmp_path, monkeypatch)
+        self._no_spawn(monkeypatch)
+
+        recorded = []
+        monkeypatch.setattr(
+            breaker, "record_failure",
+            lambda *a, **k: recorded.append((a, k)),
+        )
+
+        assert breaker.open_classes() == []
+        result = json.loads(runner.run_worker(
+            {"task": "fix it", "cwd": str(repo)}, session_id="sess:oauth-missing",
+        ))
+
+        assert result["status"] == "HOLD"
+        assert result["success"] is False
+        assert result["attempts"] == 0
+        assert result["escalated"] is False
+        assert result["failure_class"] == runner.OAUTH_PREFLIGHT_FAILURE_CLASS
+        assert result["oauth_state"] == oauth.STATE_MISSING
+        assert result["oauth_refresh_attempted"] is False
+        # No breaker mutation of any kind: not recorded, not opened, not reset.
+        assert recorded == []
+        assert result["breaker"] == {"open": False, "classes": []}
+        assert breaker.open_classes() == []
+
+    def test_preflight_failure_class_is_never_a_breaker_class(self):
+        """Structural, not incidental: the preflight's class sits outside
+        ``BREAKER_CLASSES``, so no present or future "record the failure
+        class" path can convert a HOLD into an hour of cooldown."""
+        assert runner.OAUTH_PREFLIGHT_FAILURE_CLASS not in breaker.BREAKER_CLASSES
+
+    def test_preflight_hold_leaves_an_already_open_breaker_untouched(
+        self, tmp_path, monkeypatch,
+    ):
+        """A breaker opened by a real observed failure keeps its own cooldown.
+        The open-breaker HOLD is reported first, and the preflight never
+        clears or resets anything on the way past."""
+        repo = self._repo(tmp_path, monkeypatch)
+        self._no_spawn(monkeypatch)
+        breaker.record_failure("auth", {"auth": 3600})
+
+        result = json.loads(runner.run_worker(
+            {"task": "fix it", "cwd": str(repo)}, session_id="sess:oauth-breaker-open",
+        ))
+
+        assert result["failure_class"] == "breaker_open"
+        assert result["breaker"]["open"] is True
+        assert breaker.open_classes() == ["auth"]
+
+    def test_expired_without_refresh_token_holds(self, tmp_path, monkeypatch):
+        repo = self._repo(tmp_path, monkeypatch)
+        write_credentials(
+            self.creds, refresh_token=None, expires_at=(self.now - 10) * 1000,
+        )
+        self._no_spawn(monkeypatch)
+
+        result = json.loads(runner.run_worker(
+            {"task": "fix it", "cwd": str(repo)}, session_id="sess:oauth-expired",
+        ))
+
+        assert result["status"] == "HOLD"
+        assert result["oauth_state"] == oauth.STATE_EXPIRED
+        assert result["oauth_refresh_attempted"] is False
+
+    def test_refreshable_expired_without_a_probe_holds(self, tmp_path, monkeypatch):
+        """Production installs no probe, so a refreshable-expired credential
+        HOLDs rather than hand-rolling a privileged refresh."""
+        repo = self._repo(tmp_path, monkeypatch)
+        write_credentials(self.creds, expires_at=(self.now - 10) * 1000)
+        self._no_spawn(monkeypatch)
+
+        result = json.loads(runner.run_worker(
+            {"task": "fix it", "cwd": str(repo)}, session_id="sess:oauth-refreshable",
+        ))
+
+        assert result["status"] == "HOLD"
+        assert result["oauth_state"] == oauth.STATE_REFRESHABLE_EXPIRED
+        assert result["oauth_refresh_attempted"] is False
+
+    # -- a probe that actually restores the credential lets ONE attempt run -
+
+    def test_successful_probe_permits_exactly_one_attempt(self, tmp_path, monkeypatch):
+        repo = self._repo(tmp_path, monkeypatch)
+        write_credentials(self.creds, expires_at=(self.now - 10) * 1000)
+        calls = self._spawns(monkeypatch)
+
+        probe_calls = []
+
+        def _probe():
+            probe_calls.append(True)
+            write_credentials(self.creds, expires_at=(self.now + 3600) * 1000)
+            return {"ok": True}
+
+        monkeypatch.setattr(oauth, "REFRESH_PROBE", _probe)
+
+        result = json.loads(runner.run_worker(
+            {"task": "fix it", "cwd": str(repo)}, session_id="sess:oauth-probe-ok",
+        ))
+
+        assert len(probe_calls) == 1
+        assert len(calls) == 1
+        assert result["success"] is True
+        assert result["attempts"] == 1
+
+    def test_failing_probe_holds_after_exactly_one_attempt_at_refresh(
+        self, tmp_path, monkeypatch,
+    ):
+        repo = self._repo(tmp_path, monkeypatch)
+        write_credentials(self.creds, expires_at=(self.now - 10) * 1000)
+        self._no_spawn(monkeypatch)
+
+        probe_calls = []
+        monkeypatch.setattr(
+            oauth, "REFRESH_PROBE",
+            lambda: probe_calls.append(True) or {"ok": False, "reason": "refresh rejected"},
+        )
+
+        result = json.loads(runner.run_worker(
+            {"task": "fix it", "cwd": str(repo)}, session_id="sess:oauth-probe-fail",
+        ))
+
+        assert len(probe_calls) == 1
+        assert result["status"] == "HOLD"
+        assert result["oauth_refresh_attempted"] is True
+        assert result["oauth_state"] == oauth.STATE_REFRESHABLE_EXPIRED
+
+    # -- ordering ----------------------------------------------------------
+
+    def test_cwd_is_validated_before_the_preflight_runs(self, tmp_path, monkeypatch):
+        """An invalid cwd is still ``cwd_rejected``, not an OAuth HOLD — the
+        preflight sits after cwd validation, never in front of it."""
+        self._repo(tmp_path, monkeypatch)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        self._no_spawn(monkeypatch)
+
+        probe_calls = []
+        monkeypatch.setattr(oauth, "preflight", lambda *a, **k: probe_calls.append(True))
+
+        result = json.loads(runner.run_worker(
+            {"task": "fix it", "cwd": str(outside)}, session_id="sess:oauth-after-cwd",
+        ))
+
+        assert result["failure_class"] == "cwd_rejected"
+        assert probe_calls == []
+
+    def test_preflight_runs_before_any_baseline_evidence_gathering(
+        self, tmp_path, monkeypatch,
+    ):
+        """No git-status container is started for a run that can never spawn."""
+        repo = self._repo(tmp_path, monkeypatch)
+        self._no_spawn(monkeypatch)
+
+        def _must_not_gather(cwd, repo_roots=None):
+            raise AssertionError("baseline evidence must not be gathered before a spawn")
+
+        monkeypatch.setattr(runner, "_git_changed_files", _must_not_gather)
+
+        result = json.loads(runner.run_worker(
+            {"task": "fix it", "cwd": str(repo)}, session_id="sess:oauth-before-evidence",
+        ))
+        assert result["status"] == "HOLD"
+
+    # -- result hygiene ----------------------------------------------------
+
+    def test_hold_payload_carries_no_token_or_raw_credential_json(
+        self, tmp_path, monkeypatch,
+    ):
+        repo = self._repo(tmp_path, monkeypatch)
+        access = "sk-ant-oat01-DEADBEEFACCESSTOKEN"
+        refresh = "sk-ant-ort01-DEADBEEFREFRESHTOKEN"
+        write_credentials(
+            self.creds, access_token=access, refresh_token=refresh,
+            expires_at=(self.now - 10) * 1000,
+        )
+        self._no_spawn(monkeypatch)
+        monkeypatch.setattr(
+            oauth, "REFRESH_PROBE",
+            lambda: {"ok": False, "reason": f"server rejected {refresh}"},
+        )
+
+        raw = runner.run_worker(
+            {"task": "fix it", "cwd": str(repo)}, session_id="sess:oauth-redaction",
+        )
+
+        assert access not in raw
+        assert refresh not in raw
+        assert "accessToken" not in raw
+        assert "refreshToken" not in raw
+        # ...and the free-text probe reason never rides out on the result at
+        # all: the operator text is a canned literal keyed by state.
+        assert "server rejected" not in raw
+
+    def test_hold_payload_cannot_unlock_the_gate(self, tmp_path, monkeypatch):
+        """Every field ``gate._fallback_delivered`` requires is pinned to the
+        locked value, so a preflight HOLD can never release direct edits."""
+        repo = self._repo(tmp_path, monkeypatch)
+        self._no_spawn(monkeypatch)
+
+        result = json.loads(runner.run_worker(
+            {"task": "fix it", "cwd": str(repo), "allow_terra_fallback": True},
+            session_id="sess:oauth-no-unlock",
+        ))
+
+        assert result["success"] is False
+        assert result["fallback_ready"] is False
+        assert result["fallback_requested"] is False
+        assert result["fallback_provenance"] is None
+        assert result["fallback"] is None
+
+    # -- telemetry ---------------------------------------------------------
+
+    def test_preflight_hold_emits_exactly_one_telemetry_record(
+        self, tmp_path, monkeypatch,
+    ):
+        repo = self._repo(tmp_path, monkeypatch)
+        self._no_spawn(monkeypatch)
+
+        records = []
+        monkeypatch.setattr(
+            telemetry, "append_record",
+            lambda record, configured_path="": records.append(record),
+        )
+
+        runner.run_worker({"task": "fix it", "cwd": str(repo)}, session_id="sess:oauth-telemetry")
+
+        assert len(records) == 1
+        record = records[0]
+        assert record["attempt"] == 0
+        assert record["success"] is False
+        assert record["failure_class"] == runner.OAUTH_PREFLIGHT_FAILURE_CLASS
+        assert record["breaker_state"] == "closed"
+
+    def test_a_preflight_that_raises_fails_closed_with_one_record(
+        self, tmp_path, monkeypatch,
+    ):
+        """``oauth.preflight`` is documented never to raise, but if it ever
+        did the orchestrator must still degrade closed: no spawn, one
+        redacted result, one telemetry record."""
+        repo = self._repo(tmp_path, monkeypatch)
+        self._no_spawn(monkeypatch)
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("credential check exploded: /root/.claude/.credentials.json")
+
+        monkeypatch.setattr(oauth, "preflight", _boom)
+
+        records = []
+        monkeypatch.setattr(
+            telemetry, "append_record",
+            lambda record, configured_path="": records.append(record),
+        )
+
+        raw = runner.run_worker({"task": "fix it", "cwd": str(repo)}, session_id="sess:oauth-raises")
+        result = json.loads(raw)
+
+        assert result["success"] is False
+        assert result["failure_class"] == "internal_error"
+        assert "/root/.claude/.credentials.json" not in raw
+        assert len(records) == 1

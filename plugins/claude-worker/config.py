@@ -16,18 +16,46 @@ add — is discarded rather than passed through.
 
 Operational knobs only:
 
-* ``canary.enabled`` / ``canary.channel_ids`` — disable, or select a subset
-  of the policy channels (``policy.enabled_canary_channel_ids`` enforces
-  that it can only ever narrow).
-* ``gate.repo_roots``       — where the worker may run and the gate applies.
+* ``discord.enabled``       — the ONE global kill switch. Scope is now every
+  Discord-origin session (guild channel, DM, and every thread under either),
+  so the only thing configuration may do is turn the whole feature off for
+  every session at once. It can never widen scope, and it can no longer
+  narrow it to hand-picked channels either.
 * ``isolation.timeout_seconds`` — clamped to sane bounds.
 * ``review`` / ``verification`` / ``breaker.cooldown_seconds``.
+* ``oauth.auto_refresh`` / ``oauth.refresh_timeout_seconds`` — whether the
+  isolated host-CLI refresh probe (``oauth_refresh.py``) runs at all, and how
+  long the host CLI may run, clamped to
+  ``[MIN_REFRESH_TIMEOUT_SECONDS, MAX_REFRESH_TIMEOUT_SECONDS]``. Everything
+  that probe actually executes — the binary, the lock path, the argv, the
+  child environment, and the prompt — is a literal in ``oauth_refresh.py``
+  and is deliberately NOT part of this namespace: a config-supplied command
+  or credential path would be a direct route into a privileged host
+  subprocess.
 
-``telemetry.path`` is still parsed here for backward compatibility but is
-DEPRECATED and inert: ``telemetry.append_record`` always writes to the fixed
-``get_hermes_home()/claude-worker/telemetry.jsonl`` destination and ignores
-any ``configured_path`` it is passed, so a config-supplied value can never
-redirect telemetry to an attacker-chosen file.
+Three keys are still PARSED for backward compatibility and are otherwise
+INERT — a stale config.yaml keeps loading, but none of them can change
+behavior:
+
+* ``canary.enabled`` — DEPRECATED alias for ``discord.enabled``. It still
+  works (an operator who disabled the old two-channel canary keeps the
+  feature off), and ``_validate`` folds it into ``discord.enabled`` so
+  ``policy.discord_scope_enabled`` sees one effective answer.
+* ``canary.channel_ids`` — DEPRECATED and fully inert. Scope is the PLATFORM
+  now, so there is no channel allowlist for this to narrow (or widen);
+  ``policy.py`` never reads it and neither does ``canary.py``.
+* ``gate.repo_roots`` — DEPRECATED and fully inert. The gate and the runner
+  both derive scope from the request via ``project.resolve_project_root*``
+  (the canonical Git worktree root of the requested path), so a configured
+  list can neither authorise a repository nor exclude one. Keeping it inert
+  rather than authoritative is what removed the mount hazard: whatever this
+  key named used to be what got bind-mounted, so an entry like
+  ``/root/worktrees`` handed every container every sibling checkout.
+* ``telemetry.path`` — DEPRECATED and inert: ``telemetry.append_record``
+  always writes to the fixed ``get_hermes_home()/claude-worker/telemetry.jsonl``
+  destination and ignores any ``configured_path`` it is passed, so a
+  config-supplied value can never redirect telemetry to an attacker-chosen
+  file.
 """
 
 from __future__ import annotations
@@ -40,12 +68,29 @@ PLUGIN_KEY = "claude-worker"
 MIN_TIMEOUT_SECONDS = 30
 MAX_TIMEOUT_SECONDS = 3600
 
+#: Bounds on the host-CLI refresh turn (``oauth_refresh.refresh_probe``). The
+#: default is generous enough for one cheap turn on a slow link; the floor
+#: keeps a mistyped ``0`` from making every refresh fail before it starts, and
+#: the ceiling keeps a privileged host subprocess from being told to run
+#: effectively forever.
+DEFAULT_REFRESH_TIMEOUT_SECONDS = 45
+MIN_REFRESH_TIMEOUT_SECONDS = 10
+MAX_REFRESH_TIMEOUT_SECONDS = 120
+
 DEFAULT_CONFIG: Dict[str, Any] = {
+    # The global kill switch. ``canary`` below is the deprecated alias kept
+    # for old config files; ``_validate`` keeps the two in sync so nothing
+    # downstream has to know which one an operator wrote.
+    "discord": {
+        "enabled": True,
+    },
     "canary": {
         "enabled": True,
+        # DEPRECATED, inert — see the module docstring.
         "channel_ids": [],
     },
     "gate": {
+        # DEPRECATED, inert — see the module docstring.
         "repo_roots": [],
     },
     "breaker": {
@@ -64,6 +109,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "telemetry": {
         "path": "",
+    },
+    "oauth": {
+        # On by default: an expired credential that a refresh would fix must
+        # not HOLD a session just because nobody set a knob.
+        "auto_refresh": True,
+        "refresh_timeout_seconds": DEFAULT_REFRESH_TIMEOUT_SECONDS,
     },
 }
 
@@ -103,13 +154,28 @@ def _clamp(value: int, low: int, high: int) -> int:
 def _validate(entry: Dict[str, Any]) -> Dict[str, Any]:
     cfg = copy.deepcopy(DEFAULT_CONFIG)
 
+    # One effective kill-switch answer from two accepted spellings. The
+    # deprecated ``canary.enabled`` is read first so an existing config that
+    # turned the old two-channel canary off keeps the feature off; an
+    # explicit ``discord.enabled`` bool wins when both are present.
+    enabled = True
     canary = entry.get("canary")
     if isinstance(canary, dict):
-        cfg["canary"]["enabled"] = _bool(canary.get("enabled"), True)
+        enabled = _bool(canary.get("enabled"), enabled)
+        # Parsed, never read — kept only so a stale file still validates.
         cfg["canary"]["channel_ids"] = _str_list(canary.get("channel_ids"))
+
+    discord = entry.get("discord")
+    if isinstance(discord, dict):
+        enabled = _bool(discord.get("enabled"), enabled)
+
+    cfg["discord"]["enabled"] = enabled
+    cfg["canary"]["enabled"] = enabled
 
     gate = entry.get("gate")
     if isinstance(gate, dict):
+        # Parsed, never read — project scope is resolved dynamically from
+        # the request by ``project.py``, shared by the gate and the runner.
         cfg["gate"]["repo_roots"] = _str_list(gate.get("repo_roots"))
 
     breaker = entry.get("breaker")
@@ -146,6 +212,19 @@ def _validate(entry: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(telemetry, dict):
         path = telemetry.get("path")
         cfg["telemetry"]["path"] = path if isinstance(path, str) else ""
+
+    oauth = entry.get("oauth")
+    if isinstance(oauth, dict):
+        # Only a real ``False`` turns the probe off — a truthy-looking
+        # ``"no"`` must not read as "off" when "off" means an expired
+        # credential HOLDs a session that could have been recovered. Every
+        # other key here is dropped on the floor: nothing configuration
+        # supplies may reach the privileged host subprocess.
+        cfg["oauth"]["auto_refresh"] = _bool(oauth.get("auto_refresh"), True)
+        cfg["oauth"]["refresh_timeout_seconds"] = _clamp(
+            _int(oauth.get("refresh_timeout_seconds"), DEFAULT_REFRESH_TIMEOUT_SECONDS),
+            MIN_REFRESH_TIMEOUT_SECONDS, MAX_REFRESH_TIMEOUT_SECONDS,
+        )
 
     return cfg
 

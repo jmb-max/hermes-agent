@@ -2105,6 +2105,7 @@ def _get_pre_tool_call_directive_details(
     turn_id: str = "",
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    gateway_session_key: str = "",
 ) -> _PreToolCallDirective:
     """Check ``pre_tool_call`` hooks for a blocking or approval directive.
 
@@ -2131,6 +2132,14 @@ def _get_pre_tool_call_directive_details(
 
     The first valid directive wins. Invalid or irrelevant hook return values
     are silently ignored so existing observer-only hooks are unaffected.
+
+    ``session_id`` stays the TRANSCRIPT session id every existing consumer
+    already correlates on. ``gateway_session_key`` travels alongside it as the
+    STABLE per-chat key the gateway built (``agent:<profile>:<platform>:…``),
+    for hooks that must answer "which CHAT is this call from?" — the transcript
+    id names no platform and is re-minted by context compression. It is
+    optional: callers with no gateway key (the CLI, and every pre-existing call
+    site) pass nothing and hooks see ``""``.
     """
     allowed = getattr(_thread_tool_whitelist, "allowed", None)
     if allowed is not None and tool_name not in allowed:
@@ -2146,6 +2155,7 @@ def _get_pre_tool_call_directive_details(
         args=args if isinstance(args, dict) else {},
         task_id=task_id,
         session_id=session_id,
+        gateway_session_key=gateway_session_key or "",
         tool_call_id=tool_call_id,
         turn_id=turn_id,
         api_request_id=api_request_id,
@@ -2232,6 +2242,7 @@ def resolve_pre_tool_block(
     turn_id: str = "",
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    gateway_session_key: str = "",
 ) -> Optional[str]:
     """Resolve the pre_tool_call directive to a final block message (or None).
 
@@ -2246,11 +2257,16 @@ def resolve_pre_tool_block(
     dispatch paths: an ``approve`` directive whose gate errors, denies, or
     times out is fail-closed to a block; ``block`` blocks with its message;
     anything else proceeds.
+
+    ``gateway_session_key`` is the optional stable per-chat key that travels
+    alongside the transcript ``session_id`` — see
+    :func:`_get_pre_tool_call_directive_details`.
     """
     details = _get_pre_tool_call_directive_details(
         tool_name, args, task_id=task_id, session_id=session_id,
         tool_call_id=tool_call_id, turn_id=turn_id,
         api_request_id=api_request_id, middleware_trace=middleware_trace,
+        gateway_session_key=gateway_session_key,
     )
     if details.action == "block":
         return details.message
