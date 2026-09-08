@@ -168,6 +168,39 @@ class TestToolAndHookRegistration:
         assert "allowlisted repo root" not in cwd_description
         assert "configured claude-worker repo root" not in cwd_description
 
+    def test_allow_opus_is_a_dedicated_boolean_field(self, registered_plugin):
+        """Requirement 2: Opus authorization must be an explicit, separate
+        input the caller opts into — not folded into ``complexity``."""
+        module, _manager, _ctx = registered_plugin
+        props = module.TOOL_SCHEMA["parameters"]["properties"]
+        assert props["allow_opus"]["type"] == "boolean"
+        assert "true" in props["allow_opus"]["description"].lower()
+
+    def test_complexity_alone_is_documented_as_insufficient_for_opus(self, registered_plugin):
+        module, _manager, _ctx = registered_plugin
+        props = module.TOOL_SCHEMA["parameters"]["properties"]
+        complexity_description = props["complexity"]["description"]
+        # The retired claim ("forces claude-opus-5 routing regardless of
+        # keyword detection") must be gone — complexity alone must never
+        # read as sufficient authorization on its own.
+        assert "forces" not in complexity_description.lower()
+        assert "regardless of keyword detection" not in complexity_description.lower()
+        assert "allow_opus" in complexity_description
+        assert "authorizes NOTHING" in complexity_description
+
+    def test_description_documents_no_keyword_routing_and_no_escalation(self, registered_plugin):
+        module, _manager, _ctx = registered_plugin
+        description = module.TOOL_SCHEMA["description"]
+        assert "never automatically retried" in description or "no automatic escalation" in description
+        assert "Task text/keywords never choose" in description
+
+    def test_description_documents_validation_status_semantics(self, registered_plugin):
+        module, _manager, _ctx = registered_plugin
+        description = module.TOOL_SCHEMA["description"]
+        assert "validation_status" in description
+        assert "parent_verification_required" in description
+        assert "Bash is unavailable" in description or "Bash is denied" in description
+
 
 class TestEndToEndEnforcementThroughRegisterCtx:
     def test_an_arbitrary_discord_channel_is_blocked_end_to_end(
