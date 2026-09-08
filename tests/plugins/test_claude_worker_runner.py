@@ -3,8 +3,9 @@
 
 Covers requirements (1)/(4)/(6)/(9): the claude_worker tool handler itself —
 routing + breaker + isolated spawn + evidence + exactly-one-telemetry-record
-per invocation, with the hard "no third spawn" guarantee proven by call
-counting on a mocked ``spawn_claude``. The container command shape itself
+per invocation, with the hard "exactly one spawn, no failure-driven retry or
+escalation" guarantee proven by call counting on a mocked ``spawn_claude``.
+The container command shape itself
 (mounts, hardening, preflight) is covered by
 ``test_claude_worker_isolation.py``; ``spawn_claude`` is mocked here at the
 orchestration boundary — it never spawns a host ``claude`` process, only the
@@ -370,7 +371,10 @@ class TestRunWorkerBreakerOpen:
 
 
 class TestRunWorkerEscalation:
-    def test_sonnet_failure_escalates_once_to_opus_success(self, tmp_path, monkeypatch):
+    def test_generic_failure_returns_as_is_without_escalation(self, tmp_path, monkeypatch):
+        """A plain task failure (``other`` class) is exactly one spawn on
+        Sonnet, reported as-is — no second, bigger-model attempt is ever
+        made, whether it would have failed again or succeeded."""
         repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
 
@@ -378,9 +382,7 @@ class TestRunWorkerEscalation:
 
         def _fake_spawn(**kwargs):
             calls.append(kwargs)
-            if len(calls) == 1:
-                return _spawn_result(exit_code=1, stderr="Traceback: something broke", model=kwargs["model"])
-            return _spawn_result(exit_code=0, stdout=json.dumps({"result": "done", "is_error": False}), model=kwargs["model"])
+            return _spawn_result(exit_code=1, stderr="Traceback: something broke", model=kwargs["model"])
 
         monkeypatch.setattr(runner, "spawn_claude", _fake_spawn)
         monkeypatch.setattr(runner, "_git_changed_files", lambda cwd, repo_roots=None: [])
@@ -388,32 +390,36 @@ class TestRunWorkerEscalation:
         raw = runner.run_worker({"task": "hard bug", "cwd": str(repo)}, session_id="sess:3")
         result = json.loads(raw)
 
-        assert len(calls) == 2
+        assert len(calls) == 1
         assert calls[0]["model"] == "claude-sonnet-5"
-        assert calls[1]["model"] == "claude-opus-5"
-        assert result["success"] is True
-        assert result["escalated"] is True
-        assert result["attempts"] == 2
-        assert result["model"] == "claude-opus-5"
+        assert result["success"] is False
+        assert result["escalated"] is False
+        assert result["attempts"] == 1
+        assert result["model"] == "claude-sonnet-5"
+        assert result["failure_class"] == "other"
 
-    def test_escalation_uses_only_remaining_total_budget(self, tmp_path, monkeypatch):
+    def test_single_attempt_timeout_is_clamped_to_total_budget_and_never_retries(
+        self, tmp_path, monkeypatch,
+    ):
+        """The single allowed attempt's timeout is still clamped to
+        ``policy.MAX_TOTAL_ATTEMPT_SECONDS`` — that budget math survives even
+        though there is no longer a second attempt to split it with — and a
+        timeout on that lone attempt still never triggers a retry."""
         repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(
             config, "_load_raw_config",
-            lambda: _cfg_with_roots(repo, isolation={"timeout_seconds": 900}),
+            lambda: _cfg_with_roots(
+                repo, isolation={"timeout_seconds": policy.MAX_TOTAL_ATTEMPT_SECONDS + 500},
+            ),
         )
         calls = []
 
         def _fake_spawn(**kwargs):
             calls.append(kwargs)
-            if len(calls) == 1:
-                return _spawn_result(
-                    exit_code=1, timed_out=True, duration_ms=900_000,
-                    model=kwargs["model"],
-                )
             return _spawn_result(
-                exit_code=0, stdout=json.dumps({"result": "done"}),
-                duration_ms=100, model=kwargs["model"],
+                exit_code=1, timed_out=True,
+                duration_ms=policy.MAX_TOTAL_ATTEMPT_SECONDS * 1000,
+                model=kwargs["model"],
             )
 
         monkeypatch.setattr(runner, "spawn_claude", _fake_spawn)
@@ -423,30 +429,11 @@ class TestRunWorkerEscalation:
             {"task": "hard bug", "cwd": str(repo)}, session_id="sess:budget",
         ))
 
-        assert result["success"] is True
-        assert [call["timeout_seconds"] for call in calls] == [
-            900, policy.MAX_TOTAL_ATTEMPT_SECONDS - 900,
-        ]
-
-    def test_no_third_spawn_after_two_failures(self, tmp_path, monkeypatch):
-        repo = make_git_repo(tmp_path, "repo")
-        monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
-
-        calls = []
-
-        def _fake_spawn(**kwargs):
-            calls.append(kwargs)
-            return _spawn_result(exit_code=1, stderr="Traceback: still broken", model=kwargs["model"])
-
-        monkeypatch.setattr(runner, "spawn_claude", _fake_spawn)
-
-        raw = runner.run_worker({"task": "hard bug", "cwd": str(repo)}, session_id="sess:4")
-        result = json.loads(raw)
-
-        assert len(calls) == 2
+        assert len(calls) == 1
+        assert calls[0]["timeout_seconds"] == policy.MAX_TOTAL_ATTEMPT_SECONDS
         assert result["success"] is False
-        assert result["attempts"] == 2
-        assert result["escalated"] is True
+        assert result["attempts"] == 1
+        assert result["escalated"] is False
 
     def test_auth_failure_opens_breaker_and_does_not_escalate(self, tmp_path, monkeypatch):
         repo = make_git_repo(tmp_path, "repo")
@@ -505,10 +492,13 @@ class TestRunWorkerEscalation:
         assert breaker.is_open() is True
         assert raw_token_marker not in raw
 
-    def test_malformed_json_stdout_with_generic_failure_still_escalates_safely(self, tmp_path, monkeypatch):
+    def test_malformed_json_stdout_with_generic_failure_returns_as_is_without_escalation(
+        self, tmp_path, monkeypatch,
+    ):
         """Non-JSON/garbled stdout must never raise and must not be
-        misclassified as auth — it should behave exactly like the existing
-        generic-failure path (escalate once to Opus)."""
+        misclassified as auth — it behaves exactly like any other
+        generic-failure path: exactly one spawn, reported as-is, no
+        escalation and no breaker mutation."""
         repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
 
@@ -516,9 +506,7 @@ class TestRunWorkerEscalation:
 
         def _fake_spawn(**kwargs):
             calls.append(kwargs)
-            if len(calls) == 1:
-                return _spawn_result(exit_code=1, stdout="not json{{{", stderr="", model=kwargs["model"])
-            return _spawn_result(exit_code=0, stdout=json.dumps({"result": "done", "is_error": False}), model=kwargs["model"])
+            return _spawn_result(exit_code=1, stdout="not json{{{", stderr="", model=kwargs["model"])
 
         monkeypatch.setattr(runner, "spawn_claude", _fake_spawn)
         monkeypatch.setattr(runner, "_git_changed_files", lambda cwd, repo_roots=None: [])
@@ -526,9 +514,11 @@ class TestRunWorkerEscalation:
         raw = runner.run_worker({"task": "fix it", "cwd": str(repo)}, session_id="sess:7")
         result = json.loads(raw)
 
-        assert len(calls) == 2
-        assert result["success"] is True
-        assert result["escalated"] is True
+        assert len(calls) == 1
+        assert result["success"] is False
+        assert result["escalated"] is False
+        assert result["attempts"] == 1
+        assert result["failure_class"] == "other"
         assert breaker.is_open() is False
 
 
@@ -1227,8 +1217,8 @@ class TestOAuthPreflightIntegration:
         self, tmp_path, monkeypatch,
     ):
         repo = self._repo(tmp_path, monkeypatch)
-        access = "sk-ant-oat01-DEADBEEFACCESSTOKEN"
-        refresh = "sk-ant-ort01-DEADBEEFREFRESHTOKEN"
+        access = "sk-ant-" + "oat01-" + "DEADBEEFACCESSTOKEN"
+        refresh = "sk-ant-" + "ort01-" + "DEADBEEFREFRESHTOKEN"
         write_credentials(
             self.creds, access_token=access, refresh_token=refresh,
             expires_at=(self.now - 10) * 1000,
@@ -1318,3 +1308,765 @@ class TestOAuthPreflightIntegration:
         assert result["failure_class"] == "internal_error"
         assert "/root/.claude/.credentials.json" not in raw
         assert len(records) == 1
+
+
+# ---------------------------------------------------------------------------
+# Bounded, redacted failure diagnostics — the 2026-09-07/08 incident: a run
+# of "other" failures at 03:50-04:41 UTC left telemetry with no stderr and
+# the agent-visible tool result truncated before anything actionable, so
+# root cause was unrecoverable. These cover the pure helpers, the
+# ``_run_attempts`` wiring, and the end-to-end ``run_worker`` -> telemetry
+# path, including that the diagnostic never leaks into the caller-facing
+# JSON result and is never fabricated on a success/preflight/refusal path.
+# ---------------------------------------------------------------------------
+
+
+class TestBoundedFailureDiagnosticHelpers:
+    """Direct unit coverage of ``runner._bounded_diagnostic`` and its two
+    callers. Pure functions — no spawn, no orchestration."""
+
+    def test_prefers_stderr_over_stdout_when_both_are_present(self):
+        diag = runner._diagnostics_from_spawn("stdout body", "the real error")
+        assert diag["error_source"] == "stderr"
+        assert diag["error_excerpt"] == "the real error"
+
+    def test_falls_back_to_stdout_json_result_when_stderr_is_empty(self):
+        stdout = json.dumps({"is_error": True, "result": "task failed: bad input"})
+        diag = runner._diagnostics_from_spawn(stdout, "")
+        assert diag["error_source"] == "stdout_json_result"
+        assert diag["error_excerpt"] == "task failed: bad input"
+
+    def test_falls_back_to_raw_stdout_when_it_is_not_json(self):
+        diag = runner._diagnostics_from_spawn("not json at all", "")
+        assert diag["error_source"] == "stdout"
+        assert diag["error_excerpt"] == "not json at all"
+
+    def test_falls_back_to_raw_stdout_when_json_has_no_result_field(self):
+        stdout = json.dumps({"is_error": True, "exit_code": 2})
+        diag = runner._diagnostics_from_spawn(stdout, "")
+        assert diag["error_source"] == "stdout"
+        assert diag["error_excerpt"] == stdout
+
+    def test_empty_stdout_and_stderr_is_an_empty_but_well_shaped_diagnostic(self):
+        diag = runner._diagnostics_from_spawn("", "")
+        assert diag == {
+            "error_source": "", "error_excerpt": "", "error_fingerprint": "",
+            "api_error_status": None,
+        }
+
+    @pytest.mark.parametrize(
+        "status_field", ["api_error_status", "status", "status_code", "code"],
+    )
+    def test_numeric_status_is_captured_from_every_known_field_name(self, status_field):
+        stdout = json.dumps({"is_error": True, status_field: 500, "result": "server error"})
+        diag = runner._diagnostics_from_spawn(stdout, "")
+        assert diag["api_error_status"] == 500
+
+    @pytest.mark.parametrize("status_field", ["status", "status_code", "code"])
+    def test_numeric_status_is_captured_when_nested_under_error(self, status_field):
+        stdout = json.dumps({"is_error": True, "error": {status_field: 503}, "result": "oops"})
+        diag = runner._diagnostics_from_spawn(stdout, "")
+        assert diag["api_error_status"] == 503
+
+    def test_a_non_integer_status_field_is_never_captured(self):
+        stdout = json.dumps({"is_error": True, "status": "unauthorized", "result": "oops"})
+        diag = runner._diagnostics_from_spawn(stdout, "")
+        assert diag["api_error_status"] is None
+
+    def test_an_absolute_path_is_scrubbed_out_of_the_excerpt(self):
+        diag = runner._diagnostics_from_text(
+            "exception", "failed to read /home/operator/secret-project/config.yaml",
+        )
+        assert "/home/operator" not in diag["error_excerpt"]
+        assert "secret-project" not in diag["error_excerpt"]
+        assert "[PATH]" in diag["error_excerpt"]
+
+    @pytest.mark.parametrize(
+        "secret",
+        [
+            "sk-ant-" + "api03-" + "AAAABBBBCCCCDDDDEEEEFFFF",
+            "ghp_" + "1234567890abcdef1234567890abcdef",
+            "AKIA" + "ABCDEFGHIJKLMNOP",
+            "xox" + "b-" + "1234567890-abcdefghijklmnop",
+        ],
+        ids=["anthropic-key", "github-pat", "aws-key", "slack-token"],
+    )
+    def test_bearer_and_api_key_shaped_secrets_are_redacted(self, secret):
+        diag = runner._diagnostics_from_text("exception", f"auth failed with token {secret}")
+        assert secret not in diag["error_excerpt"]
+        assert "[REDACTED]" in diag["error_excerpt"]
+
+    def test_the_excerpt_is_bounded_regardless_of_input_size(self):
+        huge = "x" * 50_000
+        diag = runner._diagnostics_from_text("exception", huge)
+        assert len(diag["error_excerpt"]) <= runner._MAX_ERROR_EXCERPT_CHARS
+
+    def test_the_fingerprint_is_deterministic_for_identical_input(self):
+        a = runner._diagnostics_from_text("exception", "boom: connection reset")
+        b = runner._diagnostics_from_text("exception", "boom: connection reset")
+        assert a["error_fingerprint"] == b["error_fingerprint"]
+        assert a["error_fingerprint"].startswith("sha256:")
+
+    def test_the_fingerprint_differs_for_different_input(self):
+        a = runner._diagnostics_from_text("exception", "boom: connection reset")
+        b = runner._diagnostics_from_text("exception", "boom: disk full")
+        assert a["error_fingerprint"] != b["error_fingerprint"]
+
+    def test_the_fingerprint_differs_by_source_for_identical_text(self):
+        a = runner._diagnostics_from_text("stderr", "boom")
+        b = runner._diagnostics_from_text("exception", "boom")
+        assert a["error_fingerprint"] != b["error_fingerprint"]
+
+    def test_the_fingerprint_is_computed_after_redaction_not_before(self):
+        """Two inputs that differ only in WHICH secret they carry redact to
+        the identical excerpt, so they must fingerprint identically — the
+        fingerprint is evidence over the redacted shape, never a side
+        channel back to the original secret."""
+        a = runner._diagnostics_from_text(
+            "exception",
+            "token " + "sk-ant-" + "api03-" + "AAAABBBBCCCCDDDDEEEEFFFF" + " rejected",
+        )
+        b = runner._diagnostics_from_text(
+            "exception",
+            "token " + "sk-ant-" + "api03-" + "ZZZZYYYYXXXXWWWWVVVVUUUU" + " rejected",
+        )
+        assert a["error_excerpt"] == b["error_excerpt"]
+        assert a["error_fingerprint"] == b["error_fingerprint"]
+
+    def test_never_includes_the_full_raw_stdout_body_beyond_the_bound(self):
+        stdout = json.dumps({"is_error": True, "result": "y" * 10_000})
+        diag = runner._diagnostics_from_spawn(stdout, "")
+        assert stdout not in diag["error_excerpt"]
+        assert len(diag["error_excerpt"]) <= runner._MAX_ERROR_EXCERPT_CHARS
+
+
+class TestRunAttemptsDiagnostics:
+    """``_run_attempts`` must capture a bounded, redacted diagnostic for a
+    failing attempt and never fabricate one on success."""
+
+    def test_success_never_carries_a_diagnostic(self, tmp_path, monkeypatch):
+        repo = make_git_repo(tmp_path, "repo")
+        monkeypatch.setattr(
+            runner, "spawn_claude",
+            lambda **kw: _spawn_result(exit_code=0, stdout=json.dumps({"result": "ok"}), model=kw["model"]),
+        )
+        outcome = runner._run_attempts(task="fix it", cwd=str(repo), complexity=None, cfg={})
+        assert outcome["success"] is True
+        assert outcome["diagnostic"] is None
+
+    def test_other_failure_carries_a_bounded_diagnostic(self, tmp_path, monkeypatch):
+        repo = make_git_repo(tmp_path, "repo")
+        monkeypatch.setattr(
+            runner, "spawn_claude",
+            lambda **kw: _spawn_result(exit_code=1, stderr="Traceback: something broke", model=kw["model"]),
+        )
+        outcome = runner._run_attempts(task="fix it", cwd=str(repo), complexity=None, cfg={})
+        assert outcome["success"] is False
+        assert outcome["failure_class"] == "other"
+        assert outcome["diagnostic"]["error_source"] == "stderr"
+        assert outcome["diagnostic"]["error_excerpt"] == "Traceback: something broke"
+        assert outcome["diagnostic"]["error_fingerprint"].startswith("sha256:")
+
+    def test_auth_breaker_failure_still_carries_a_diagnostic(self, tmp_path, monkeypatch):
+        repo = make_git_repo(tmp_path, "repo")
+        monkeypatch.setattr(
+            runner, "spawn_claude",
+            lambda **kw: _spawn_result(exit_code=1, stderr="Error: Invalid API key", model=kw["model"]),
+        )
+        outcome = runner._run_attempts(task="fix it", cwd=str(repo), complexity=None, cfg={})
+        assert outcome["failure_class"] == "auth"
+        assert outcome["diagnostic"] is not None
+
+    def test_timeout_carries_a_diagnostic_from_whatever_partial_output_exists(
+        self, tmp_path, monkeypatch,
+    ):
+        repo = make_git_repo(tmp_path, "repo")
+        monkeypatch.setattr(
+            runner, "spawn_claude",
+            lambda **kw: _spawn_result(exit_code=None, stderr="", timed_out=True, model=kw["model"]),
+        )
+        outcome = runner._run_attempts(task="fix it", cwd=str(repo), complexity=None, cfg={})
+        assert outcome["failure_class"] == "timeout"
+        assert outcome["diagnostic"] is not None
+
+    def test_isolation_refused_does_not_fabricate_a_diagnostic(self, tmp_path, monkeypatch):
+        repo = make_git_repo(tmp_path, "repo")
+
+        def _refuse(**kw):
+            raise runner.SpawnRefused("docker preflight failed")
+
+        monkeypatch.setattr(runner, "spawn_claude", _refuse)
+        outcome = runner._run_attempts(task="fix it", cwd=str(repo), complexity=None, cfg={})
+        assert outcome["failure_class"] == "isolation_refused"
+        assert outcome["diagnostic"] is None
+
+
+class TestFailureDiagnosticTelemetryIntegration:
+    """End-to-end: a failing spawn leaves actionable, bounded, redacted
+    evidence in telemetry, while success, OAuth-preflight-HOLD, and
+    breaker-open refusal never fabricate one, and it never leaks into the
+    caller-facing JSON tool result."""
+
+    def test_other_failure_telemetry_carries_the_diagnostic(self, tmp_path, monkeypatch):
+        repo = make_git_repo(tmp_path, "repo")
+        monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
+        monkeypatch.setattr(
+            runner, "spawn_claude",
+            lambda **kw: _spawn_result(exit_code=1, stderr="Traceback: it broke", model=kw["model"]),
+        )
+        records = []
+        monkeypatch.setattr(
+            telemetry, "append_record",
+            lambda record, configured_path="": records.append(record),
+        )
+
+        raw = runner.run_worker({"task": "fix it", "cwd": str(repo)}, session_id="sess:diag-other")
+        result = json.loads(raw)
+
+        assert result["failure_class"] == "other"
+        assert "diagnostic" not in result  # never leaks into the caller-facing result
+        assert len(records) == 1
+        diag = records[0]["diagnostic"]
+        assert diag["error_source"] == "stderr"
+        assert diag["error_excerpt"] == "Traceback: it broke"
+        assert diag["error_fingerprint"].startswith("sha256:")
+
+    def test_success_telemetry_never_fabricates_a_diagnostic(self, tmp_path, monkeypatch):
+        repo = make_git_repo(tmp_path, "repo")
+        monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
+        monkeypatch.setattr(
+            runner, "spawn_claude",
+            lambda **kw: _spawn_result(exit_code=0, stdout=json.dumps({"result": "done"}), model=kw["model"]),
+        )
+        monkeypatch.setattr(runner, "_git_changed_files", lambda cwd, repo_roots=None: [])
+        records = []
+        monkeypatch.setattr(
+            telemetry, "append_record",
+            lambda record, configured_path="": records.append(record),
+        )
+
+        runner.run_worker({"task": "fix it", "cwd": str(repo)}, session_id="sess:diag-success")
+
+        assert len(records) == 1
+        assert records[0]["diagnostic"] is None
+
+
+class TestRunAttemptsThreadsAllowOpus:
+    """``_run_attempts`` must pass ``allow_opus`` straight through to
+    ``routing.choose_model`` unchanged — that function is the single source
+    of truth for what counts as authorization (see
+    ``test_claude_worker_routing.py``); this only proves the wiring."""
+
+    def test_allow_opus_and_complexity_reach_choose_model(self, tmp_path, monkeypatch):
+        repo = make_git_repo(tmp_path, "repo")
+        calls = []
+
+        def _fake_choose(task, complexity=None, allow_opus=False):
+            calls.append({"task": task, "complexity": complexity, "allow_opus": allow_opus})
+            return "claude-sonnet-5", "default"
+
+        monkeypatch.setattr(runner._routing, "choose_model", _fake_choose)
+        monkeypatch.setattr(
+            runner, "spawn_claude",
+            lambda **kw: _spawn_result(exit_code=0, model=kw["model"]),
+        )
+
+        runner._run_attempts(
+            task="harden auth", cwd=str(repo), complexity="security", cfg={}, allow_opus=True,
+        )
+
+        assert calls == [{"task": "harden auth", "complexity": "security", "allow_opus": True}]
+
+    def test_omitted_allow_opus_defaults_to_false(self, tmp_path, monkeypatch):
+        repo = make_git_repo(tmp_path, "repo")
+        calls = []
+
+        def _fake_choose(task, complexity=None, allow_opus=False):
+            calls.append(allow_opus)
+            return "claude-sonnet-5", "default"
+
+        monkeypatch.setattr(runner._routing, "choose_model", _fake_choose)
+        monkeypatch.setattr(
+            runner, "spawn_claude",
+            lambda **kw: _spawn_result(exit_code=0, model=kw["model"]),
+        )
+
+        runner._run_attempts(task="fix it", cwd=str(repo), complexity=None, cfg={})
+
+        assert calls == [False]
+
+
+class TestRunWorkerModelAuthorization:
+    """End-to-end through ``run_worker``: Opus is selected only when a call
+    supplies BOTH an allowed ``complexity`` AND the literal boolean
+    ``allow_opus=True``. Existing callers that omit ``allow_opus`` entirely,
+    and callers that send a truthy-but-not-``True`` value, all stay on
+    Sonnet — never Opus."""
+
+    def _run(self, repo, monkeypatch, args, session_id):
+        monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
+        monkeypatch.setattr(
+            runner, "spawn_claude",
+            lambda **kw: _spawn_result(
+                exit_code=0, stdout=json.dumps({"result": "ok", "is_error": False}),
+                model=kw["model"],
+            ),
+        )
+        monkeypatch.setattr(runner, "_git_changed_files", lambda cwd, repo_roots=None: [])
+        return json.loads(runner.run_worker(args, session_id=session_id))
+
+    def test_complexity_and_allow_opus_true_selects_opus(self, tmp_path, monkeypatch):
+        repo = make_git_repo(tmp_path, "repo")
+        result = self._run(
+            repo, monkeypatch,
+            {"task": "harden auth", "cwd": str(repo), "complexity": "security", "allow_opus": True},
+            "sess:opus-authorized",
+        )
+        assert result["model"] == "claude-opus-5"
+        assert "authoriz" in result["route_reason"].lower()
+
+    def test_complexity_alone_stays_sonnet(self, tmp_path, monkeypatch):
+        """The exact hole this hardening closes: ``complexity`` alone used
+        to be sufficient to reach Opus."""
+        repo = make_git_repo(tmp_path, "repo")
+        result = self._run(
+            repo, monkeypatch,
+            {"task": "harden auth", "cwd": str(repo), "complexity": "architecture"},
+            "sess:opus-complexity-only",
+        )
+        assert result["model"] == "claude-sonnet-5"
+        assert result["route_reason"] == "default"
+
+    def test_allow_opus_alone_stays_sonnet(self, tmp_path, monkeypatch):
+        repo = make_git_repo(tmp_path, "repo")
+        result = self._run(
+            repo, monkeypatch,
+            {"task": "harden auth", "cwd": str(repo), "allow_opus": True},
+            "sess:opus-allow-only",
+        )
+        assert result["model"] == "claude-sonnet-5"
+
+    def test_existing_callers_omitting_allow_opus_remain_sonnet(self, tmp_path, monkeypatch):
+        repo = make_git_repo(tmp_path, "repo")
+        result = self._run(
+            repo, monkeypatch,
+            {"task": "harden auth", "cwd": str(repo)},
+            "sess:opus-omitted",
+        )
+        assert result["model"] == "claude-sonnet-5"
+
+    @pytest.mark.parametrize("truthy_but_not_true", ["true", 1, "yes"])
+    def test_truthy_non_bool_allow_opus_never_authorizes(
+        self, tmp_path, monkeypatch, truthy_but_not_true,
+    ):
+        repo = make_git_repo(tmp_path, "repo")
+        result = self._run(
+            repo, monkeypatch,
+            {
+                "task": "harden auth", "cwd": str(repo), "complexity": "security",
+                "allow_opus": truthy_but_not_true,
+            },
+            f"sess:opus-truthy-{truthy_but_not_true}",
+        )
+        assert result["model"] == "claude-sonnet-5"
+
+
+class TestResolveValidationStatusUnit:
+    """Direct unit coverage of ``_resolve_validation_status`` — the closed
+    default is ``unverified``/``parent_verification_required=True``; only a
+    real, operator-configured verifier that actually ran and exited 0 can
+    move it to ``verified_by_configured_verifier``."""
+
+    def test_task_failure_short_circuits_without_running_any_verifier(self, monkeypatch):
+        def _must_not_run(*a, **k):
+            raise AssertionError("a failed task must never trigger the verifier")
+
+        monkeypatch.setattr(runner, "run_verification_command", _must_not_run)
+        status, required, result = runner._resolve_validation_status(
+            {"verification": {"enabled": True, "command": ["pytest"]}}, "/tmp/x", False,
+        )
+        assert status == runner.VALIDATION_STATUS_UNVERIFIED
+        assert required is True
+        assert result is None
+
+    def test_missing_verification_section_stays_unverified(self):
+        status, required, result = runner._resolve_validation_status({}, "/tmp/x", True)
+        assert status == runner.VALIDATION_STATUS_UNVERIFIED
+        assert required is True
+        assert result is None
+
+    def test_enabled_without_a_command_stays_unverified(self, monkeypatch):
+        def _must_not_run(*a, **k):
+            raise AssertionError("no command configured — the verifier must never run")
+
+        monkeypatch.setattr(runner, "run_verification_command", _must_not_run)
+        status, required, result = runner._resolve_validation_status(
+            {"verification": {"enabled": True, "command": []}}, "/tmp/x", True,
+        )
+        assert status == runner.VALIDATION_STATUS_UNVERIFIED
+        assert required is True
+        assert result is None
+
+    def test_truthy_non_bool_enabled_never_authorizes_running_the_verifier(self, monkeypatch):
+        def _must_not_run(*a, **k):
+            raise AssertionError("a non-bool 'enabled' must never authorize a run")
+
+        monkeypatch.setattr(runner, "run_verification_command", _must_not_run)
+        status, required, result = runner._resolve_validation_status(
+            {"verification": {"enabled": "true", "command": ["pytest"]}}, "/tmp/x", True,
+        )
+        assert status == runner.VALIDATION_STATUS_UNVERIFIED
+        assert required is True
+        assert result is None
+
+    def test_configured_verifier_that_passes_is_verified_distinctly(self, monkeypatch):
+        monkeypatch.setattr(
+            runner, "run_verification_command",
+            lambda repo_root, command, timeout_seconds: {
+                "ok": True, "exit_code": 0, "stdout": "", "stderr": "",
+                "duration_ms": 5, "timed_out": False, "failure_class": None, "reason": "",
+            },
+        )
+        status, required, result = runner._resolve_validation_status(
+            {"verification": {"enabled": True, "command": ["pytest", "-q"]}}, "/tmp/x", True,
+        )
+        assert status == runner.VALIDATION_STATUS_VERIFIED
+        assert required is False
+        assert result["ok"] is True
+
+    def test_configured_verifier_that_fails_stays_verification_failed(self, monkeypatch):
+        monkeypatch.setattr(
+            runner, "run_verification_command",
+            lambda repo_root, command, timeout_seconds: {
+                "ok": False, "exit_code": 1, "stdout": "", "stderr": "2 failed",
+                "duration_ms": 5, "timed_out": False,
+                "failure_class": "verification_failed", "reason": "",
+            },
+        )
+        status, required, result = runner._resolve_validation_status(
+            {"verification": {"enabled": True, "command": ["pytest", "-q"]}}, "/tmp/x", True,
+        )
+        assert status == runner.VALIDATION_STATUS_VERIFICATION_FAILED
+        assert required is True
+        assert result["ok"] is False
+
+    def test_verifier_timeout_is_the_fixed_policy_constant_not_the_configured_worker_timeout(
+        self, monkeypatch,
+    ):
+        """A configured ``isolation.timeout_seconds`` of up to 900s must
+        never be handed to the verifier as-is — the verifier always gets the
+        fixed, non-configurable ``policy.VERIFICATION_TIMEOUT_SECONDS``."""
+        captured = {}
+
+        def _fake_run_verification_command(repo_root, command, timeout_seconds):
+            captured["timeout_seconds"] = timeout_seconds
+            return {
+                "ok": True, "exit_code": 0, "stdout": "", "stderr": "",
+                "duration_ms": 5, "timed_out": False, "failure_class": None, "reason": "",
+            }
+
+        monkeypatch.setattr(runner, "run_verification_command", _fake_run_verification_command)
+        runner._resolve_validation_status(
+            {
+                "verification": {"enabled": True, "command": ["pytest", "-q"]},
+                "isolation": {"timeout_seconds": 900},
+            },
+            "/tmp/x", True,
+        )
+        assert captured["timeout_seconds"] == policy.VERIFICATION_TIMEOUT_SECONDS
+        assert captured["timeout_seconds"] < 900
+
+    def test_verifier_timeout_is_bounded_further_by_a_shorter_isolation_timeout(
+        self, monkeypatch,
+    ):
+        """When the operator's isolation timeout is shorter than the fixed
+        verification timeout, the verifier must never outlive the worker's
+        own isolated run."""
+        captured = {}
+
+        def _fake_run_verification_command(repo_root, command, timeout_seconds):
+            captured["timeout_seconds"] = timeout_seconds
+            return {
+                "ok": True, "exit_code": 0, "stdout": "", "stderr": "",
+                "duration_ms": 5, "timed_out": False, "failure_class": None, "reason": "",
+            }
+
+        monkeypatch.setattr(runner, "run_verification_command", _fake_run_verification_command)
+        short_timeout = policy.VERIFICATION_TIMEOUT_SECONDS - 1
+        runner._resolve_validation_status(
+            {
+                "verification": {"enabled": True, "command": ["pytest", "-q"]},
+                "isolation": {"timeout_seconds": short_timeout},
+            },
+            "/tmp/x", True,
+        )
+        assert captured["timeout_seconds"] == short_timeout
+
+
+class TestRunWorkerValidationStatus:
+    """End-to-end: the worker's own self-reported stdout — even a claim like
+    "all tests pass" — must never be able to flip ``validation_status``.
+    Only a real, operator-configured verifier process actually run in its
+    own sandbox and inspected for its own exit code can do that."""
+
+    def _run(self, repo, monkeypatch, cfg_overrides, spawn_stdout_result, session_id):
+        monkeypatch.setattr(
+            config, "_load_raw_config",
+            lambda: _cfg_with_roots(repo, **cfg_overrides),
+        )
+        monkeypatch.setattr(
+            runner, "spawn_claude",
+            lambda **kw: _spawn_result(
+                exit_code=0,
+                stdout=json.dumps({"result": spawn_stdout_result, "is_error": False}),
+                model=kw["model"],
+            ),
+        )
+        monkeypatch.setattr(runner, "_git_changed_files", lambda cwd, repo_roots=None: ["a.py"])
+        return json.loads(runner.run_worker(
+            {"task": "fix it", "cwd": str(repo)}, session_id=session_id,
+        ))
+
+    def test_no_verifier_configured_is_unverified_despite_a_confident_summary(
+        self, tmp_path, monkeypatch,
+    ):
+        repo = make_git_repo(tmp_path, "repo")
+
+        def _must_not_run(*a, **k):
+            raise AssertionError("no verifier is configured — it must never run")
+
+        monkeypatch.setattr(runner, "run_verification_command", _must_not_run)
+
+        result = self._run(
+            repo, monkeypatch, {}, "All tests pass, fully verified and ready to merge.",
+            "sess:validation-unverified",
+        )
+
+        assert result["success"] is True
+        assert result["validation_status"] == "unverified"
+        assert result["parent_verification_required"] is True
+        assert result["verification"] is None
+
+    def test_configured_verifier_passing_is_verified_distinctly(self, tmp_path, monkeypatch):
+        repo = make_git_repo(tmp_path, "repo")
+        monkeypatch.setattr(
+            runner, "run_verification_command",
+            lambda repo_root, command, timeout_seconds: {
+                "ok": True, "exit_code": 0, "stdout": "1 passed", "stderr": "",
+                "duration_ms": 5, "timed_out": False, "failure_class": None, "reason": "",
+            },
+        )
+
+        result = self._run(
+            repo, monkeypatch,
+            {"verification": {"enabled": True, "command": ["pytest", "-q"]}},
+            "done", "sess:validation-verified",
+        )
+
+        assert result["validation_status"] == "verified_by_configured_verifier"
+        assert result["parent_verification_required"] is False
+        assert result["verification"]["ok"] is True
+
+    def test_worker_claiming_tests_pass_cannot_override_a_failing_verifier(
+        self, tmp_path, monkeypatch,
+    ):
+        """The exact regression this hardening prevents: Claude's own
+        stdout says the tests pass, but the REAL configured verifier
+        disagrees — the verifier's actual exit code must win."""
+        repo = make_git_repo(tmp_path, "repo")
+        monkeypatch.setattr(
+            runner, "run_verification_command",
+            lambda repo_root, command, timeout_seconds: {
+                "ok": False, "exit_code": 1, "stdout": "", "stderr": "1 failed",
+                "duration_ms": 5, "timed_out": False,
+                "failure_class": "verification_failed", "reason": "",
+            },
+        )
+
+        result = self._run(
+            repo, monkeypatch,
+            {"verification": {"enabled": True, "command": ["pytest", "-q"]}},
+            "All tests pass!", "sess:validation-worker-lies",
+        )
+
+        assert result["validation_status"] == "verification_failed"
+        assert result["parent_verification_required"] is True
+        assert result["verification"]["ok"] is False
+
+    def test_task_failure_is_unverified_and_never_runs_the_verifier(
+        self, tmp_path, monkeypatch,
+    ):
+        repo = make_git_repo(tmp_path, "repo")
+        monkeypatch.setattr(
+            config, "_load_raw_config",
+            lambda: _cfg_with_roots(repo, verification={"enabled": True, "command": ["pytest"]}),
+        )
+        monkeypatch.setattr(
+            runner, "spawn_claude",
+            lambda **kw: _spawn_result(exit_code=1, stderr="boom", model=kw["model"]),
+        )
+        monkeypatch.setattr(runner, "_git_changed_files", lambda cwd, repo_roots=None: [])
+
+        def _must_not_run(*a, **k):
+            raise AssertionError("the worker spawn itself failed — the verifier must never run")
+
+        monkeypatch.setattr(runner, "run_verification_command", _must_not_run)
+
+        result = json.loads(runner.run_worker(
+            {"task": "fix it", "cwd": str(repo)}, session_id="sess:validation-task-failed",
+        ))
+
+        assert result["success"] is False
+        assert result["validation_status"] == "unverified"
+        assert result["parent_verification_required"] is True
+        assert result["verification"] is None
+
+    def test_breaker_open_result_reports_unverified_by_default(self, tmp_path, monkeypatch):
+        repo = make_git_repo(tmp_path, "repo")
+        monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
+        breaker.record_failure("auth", {"auth": 3600})
+
+        result = json.loads(runner.run_worker(
+            {"task": "fix it", "cwd": str(repo)}, session_id="sess:validation-breaker-open",
+        ))
+
+        assert result["validation_status"] == "unverified"
+        assert result["parent_verification_required"] is True
+        assert result["verification"] is None
+
+
+class TestFailureDiagnosticTelemetryIntegrationContinued:
+    """Continuation of ``TestFailureDiagnosticTelemetryIntegration`` above —
+    split into its own class only because the validation-status coverage
+    was inserted between them; behavior and fixtures are unchanged."""
+
+    def test_breaker_open_refusal_never_fabricates_a_diagnostic(self, tmp_path, monkeypatch):
+        repo = make_git_repo(tmp_path, "repo")
+        monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
+        breaker.record_failure("auth", {"auth": 3600})
+        records = []
+        monkeypatch.setattr(
+            telemetry, "append_record",
+            lambda record, configured_path="": records.append(record),
+        )
+
+        runner.run_worker({"task": "fix it", "cwd": str(repo)}, session_id="sess:diag-breaker-open")
+
+        assert len(records) == 1
+        assert records[0]["diagnostic"] is None
+
+    def test_oauth_preflight_hold_never_fabricates_a_diagnostic(self, tmp_path, monkeypatch):
+        repo = make_git_repo(tmp_path, "repo")
+        monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
+        monkeypatch.setattr(
+            oauth, "preflight",
+            lambda *a, **k: {
+                "ok": False, "state": oauth.STATE_MISSING, "classification": "auth",
+                "refresh_attempted": False, "reason": "", "freshness": {},
+            },
+        )
+        records = []
+        monkeypatch.setattr(
+            telemetry, "append_record",
+            lambda record, configured_path="": records.append(record),
+        )
+
+        runner.run_worker({"task": "fix it", "cwd": str(repo)}, session_id="sess:diag-preflight-hold")
+
+        assert len(records) == 1
+        assert records[0]["diagnostic"] is None
+
+    def test_secret_and_path_shaped_content_in_a_failure_never_reaches_telemetry(
+        self, tmp_path, monkeypatch,
+    ):
+        repo = make_git_repo(tmp_path, "repo")
+        monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
+        leaked_secret = "sk-ant-" + "api03-" + "AAAABBBBCCCCDDDDEEEEFFFF"
+        monkeypatch.setattr(
+            runner, "spawn_claude",
+            lambda **kw: _spawn_result(
+                exit_code=1,
+                stderr=f"failed reading /home/operator/project/config with key {leaked_secret}",
+                model=kw["model"],
+            ),
+        )
+        records = []
+        monkeypatch.setattr(
+            telemetry, "append_record",
+            lambda record, configured_path="": records.append(record),
+        )
+
+        runner.run_worker({"task": "fix it", "cwd": str(repo)}, session_id="sess:diag-redact")
+
+        assert len(records) == 1
+        excerpt = records[0]["diagnostic"]["error_excerpt"]
+        assert leaked_secret not in excerpt
+        assert "/home/operator" not in excerpt
+        assert "[REDACTED]" in excerpt
+        assert "[PATH]" in excerpt
+
+
+class TestPostSpawnAuthSessionIntegration:
+    """The 2026-09-07/08 incident itself: the CLI exits 1 in ~1.5-1.7s with a
+    structured session-invalid signal in stdout and no numeric 401. That must
+    classify as ``auth_preflight`` end-to-end — no retry, no breaker
+    mutation, reauthentication guidance in the result, and a diagnostic in
+    telemetry."""
+
+    def test_spawn_reported_session_invalid_signal_classifies_end_to_end(
+        self, tmp_path, monkeypatch,
+    ):
+        repo = make_git_repo(tmp_path, "repo")
+        monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
+
+        calls = []
+
+        def _fake_spawn(**kwargs):
+            calls.append(kwargs)
+            stdout = json.dumps({
+                "is_error": True,
+                "subtype": "error_during_execution",
+                "result": "Invalid API key · Please run /login",
+            })
+            return _spawn_result(exit_code=1, stdout=stdout, stderr="", model=kwargs["model"])
+
+        monkeypatch.setattr(runner, "spawn_claude", _fake_spawn)
+
+        records = []
+        monkeypatch.setattr(
+            telemetry, "append_record",
+            lambda record, configured_path="": records.append(record),
+        )
+
+        raw = runner.run_worker(
+            {"task": "fix it", "cwd": str(repo)}, session_id="sess:auth-preflight-spawn",
+        )
+        result = json.loads(raw)
+
+        assert len(calls) == 1  # never retried
+        assert result["success"] is False
+        assert result["failure_class"] == breaker.AUTH_PREFLIGHT_FAILURE_CLASS
+        assert result["breaker"]["open"] is False
+        assert breaker.is_open() is False
+        assert "re-authenticate" in result["error"].lower()
+        assert len(records) == 1
+        assert records[0]["failure_class"] == breaker.AUTH_PREFLIGHT_FAILURE_CLASS
+        assert records[0]["diagnostic"] is not None
+
+    def test_bare_401_in_task_output_never_opens_the_auth_breaker(self, tmp_path, monkeypatch):
+        repo = make_git_repo(tmp_path, "repo")
+        monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
+        monkeypatch.setattr(
+            runner, "spawn_claude",
+            lambda **kw: _spawn_result(
+                exit_code=1, stderr="test_401.py::test_x FAILED", model=kw["model"],
+            ),
+        )
+
+        result = json.loads(runner.run_worker(
+            {"task": "fix it", "cwd": str(repo)}, session_id="sess:bare-401",
+        ))
+
+        assert result["failure_class"] == "other"
+        assert result["breaker"]["open"] is False
+        assert breaker.is_open() is False

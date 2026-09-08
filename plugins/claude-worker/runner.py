@@ -84,6 +84,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -93,6 +94,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from . import acl as _acl
 from . import breaker as _breaker
 from . import config as _config
 from . import oauth as _oauth
@@ -287,10 +289,20 @@ def _snapshot_mount_root(
     Every component is a real root-owned directory. Parents must not be
     writable by group/other, except a sticky directory (e.g. /tmp), whose
     sticky semantics prevent a non-owner from replacing the root-owned next
-    component. The mount root itself may expose a group-write mode bit from
-    the explicitly provisioned UID-10001 ACL mask, but it must remain
-    root-owned and never world-writable. Replacing that final entry requires
-    write access to its protected parent, not write access inside the repo.
+    component — parents stay PROTECTED; only the mount root itself may ever
+    carry sandbox-uid provisioning.
+
+    The mount root itself may expose a group-write mode bit, but never on
+    trust alone: once a directory carries a POSIX ACL, the kernel reports
+    the ACL_MASK entry — not the real owning-group permission — in the
+    "group" bits ``stat`` shows, so a genuinely-provisioned root (a named
+    ACL entry for ``policy.SANDBOX_UID``, real group/other left at r-x) and
+    a careless ``chmod g+w`` can look identical to a bare mode check.
+    ``acl.evaluate_sandbox_uid_provisioning`` reads the actual ACL to tell
+    them apart; a group-write bit with no such verified ACL is refused
+    exactly like world-writable, never silently trusted. Replacing the
+    final entry still requires write access to its protected parent, not
+    write access inside the repo.
     """
     snapshot: Dict[str, Tuple[int, int, int, int, int]] = {}
     components = _dir_chain_components(mount_root)
@@ -304,6 +316,15 @@ def _snapshot_mount_root(
         if component == mount_root:
             if mode & stat.S_IWOTH:
                 raise CwdRejected(f"mount root is world-writable: {component!r}")
+            if mode & stat.S_IWGRP:
+                safe, reason = _acl.evaluate_sandbox_uid_provisioning(
+                    component, _policy.SANDBOX_UID,
+                )
+                if not safe:
+                    raise CwdRejected(
+                        "mount root is group-writable without a verified named "
+                        f"POSIX ACL for the sandbox uid: {reason}"
+                    )
         elif mode & (stat.S_IWGRP | stat.S_IWOTH):
             if not (mode & stat.S_ISVTX):
                 raise CwdRejected(
@@ -592,6 +613,145 @@ def _remove_staging_dir(private_dir: str) -> None:
         )
 
 
+#: Stale-staging reap — best-effort cleanup for staging directories left
+#: behind by a worker that never reached its own ``spawn_claude`` ``finally``
+#: (killed, host reboot, an exception in a code path added later that
+#: forgets to re-raise through the existing ``finally``). This is opportunistic
+#: hygiene, not a security boundary, so it is deliberately conservative: an
+#: entry is removed ONLY when its ownership, exact directory shape, age, and
+#: (if a cidfile is present) the CONFIRMED absence of any container are all
+#: provably true. Anything that cannot be proven safe is left in place and
+#: logged so an operator can inspect and remove it by hand — this must never
+#: grow into a second broad-deletion mechanism.
+_STALE_STAGING_MAX_AGE_SECONDS = 2 * _config.MAX_TIMEOUT_SECONDS
+_STALE_STAGING_REAP_MAX_ENTRIES = 20
+_STAGED_CREDENTIALS_NAME = "credentials.json"
+_STAGED_CIDFILE_NAME = "container.cid"
+_STAGING_ALLOWED_ENTRY_NAMES = frozenset({_STAGED_CREDENTIALS_NAME, _STAGED_CIDFILE_NAME})
+
+
+def _staging_entry_is_stale_and_safe(entry_path: str, now: float) -> Tuple[bool, str]:
+    """Is *entry_path* (one direct child of ``CREDENTIAL_STAGING_ROOT``)
+    provably a leftover from a finished spawn that is safe to remove?
+
+    Every one of these must hold, or the entry is left alone:
+
+    * a real directory, never a symlink;
+    * owned by the trusted root uid and exactly mode 0700 — the identity
+      ``_stage_credentials`` always creates it with;
+    * every entry inside it is one of the two known staged filenames, and
+      each present one is itself a regular, non-symlink file — anything
+      else means this is not a shape this module ever produced;
+    * older than a large fixed multiple of the maximum configured spawn
+      timeout, never merely "not the newest one";
+    * if a cidfile is present: its content is a well-formed container id
+      AND docker confirms — not merely fails to deny — that the container
+      no longer exists. An unreadable/malformed cidfile, or one docker
+      cannot answer for, blocks the reap rather than being treated as
+      harmless.
+    """
+    try:
+        st = os.lstat(entry_path)
+    except OSError as exc:
+        return False, f"could not stat: {exc}"
+    if stat.S_ISLNK(st.st_mode):
+        return False, "is a symlink"
+    if not stat.S_ISDIR(st.st_mode):
+        return False, "is not a directory"
+    if st.st_uid != _TRUSTED_UID:
+        return False, "is not root-owned"
+    if stat.S_IMODE(st.st_mode) != _STAGING_DIR_MODE:
+        return False, "does not have the expected staging directory mode"
+
+    if (now - st.st_mtime) < _STALE_STAGING_MAX_AGE_SECONDS:
+        return False, "not old enough to be considered stale"
+
+    try:
+        names = os.listdir(entry_path)
+    except OSError as exc:
+        return False, f"could not list contents: {exc}"
+    if any(name not in _STAGING_ALLOWED_ENTRY_NAMES for name in names):
+        return False, "contains unexpected entries"
+
+    if _STAGED_CIDFILE_NAME in names:
+        cidfile_path = os.path.join(entry_path, _STAGED_CIDFILE_NAME)
+        try:
+            cid_st = os.lstat(cidfile_path)
+        except OSError as exc:
+            return False, f"could not stat cidfile: {exc}"
+        if stat.S_ISLNK(cid_st.st_mode) or not stat.S_ISREG(cid_st.st_mode):
+            return False, "cidfile is not a regular file"
+        try:
+            container_id = Path(cidfile_path).read_text(encoding="ascii").strip()
+        except (OSError, UnicodeError):
+            return False, "cidfile could not be read as a container id"
+        if len(container_id) != 64 or any(
+            char not in "0123456789abcdef" for char in container_id.lower()
+        ):
+            return False, "cidfile does not contain a well-formed container id"
+        if _container_still_exists(container_id, build_child_env()) is not False:
+            return False, "container existence could not be confirmed absent"
+
+    if _STAGED_CREDENTIALS_NAME in names:
+        creds_path = os.path.join(entry_path, _STAGED_CREDENTIALS_NAME)
+        try:
+            creds_st = os.lstat(creds_path)
+        except OSError as exc:
+            return False, f"could not stat staged credentials: {exc}"
+        if stat.S_ISLNK(creds_st.st_mode) or not stat.S_ISREG(creds_st.st_mode):
+            return False, "staged credentials entry is not a regular file"
+
+    return True, "stale, root-owned, exact expected shape, no active container"
+
+
+def reap_stale_staging_dirs() -> None:
+    """Best-effort removal of staging directories left behind by a worker
+    that never reached its own ``finally`` (crash, kill -9, host reboot).
+
+    Bounded to a small fixed number of entries per call and conservative by
+    construction (see ``_staging_entry_is_stale_and_safe``). Never raises —
+    called opportunistically before staging a new credentials copy, so a bug
+    here must never be able to block a spawn; anything left un-reaped is
+    logged for an operator to clean up by hand.
+    """
+    root = _policy.CREDENTIAL_STAGING_ROOT
+    try:
+        root_st = os.lstat(root)
+    except OSError:
+        return
+    if stat.S_ISLNK(root_st.st_mode) or root_st.st_uid != _TRUSTED_UID:
+        return
+
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return
+
+    now = time.time()
+    for name in entries[:_STALE_STAGING_REAP_MAX_ENTRIES]:
+        entry_path = os.path.join(root, name)
+        try:
+            safe, reason = _staging_entry_is_stale_and_safe(entry_path, now)
+        except Exception:
+            logger.warning(
+                "claude_worker: stale-staging check failed unexpectedly for %r",
+                name, exc_info=True,
+            )
+            continue
+        if not safe:
+            continue
+        try:
+            shutil.rmtree(entry_path)
+        except Exception:
+            logger.warning(
+                "claude_worker: failed to reap stale staging directory %r", name, exc_info=True,
+            )
+        else:
+            logger.warning(
+                "claude_worker: reaped stale staging directory %r (%s)", name, reason,
+            )
+
+
 def _stage_credentials(
     creds_fd: int,
 ) -> Tuple[str, str, Dict[str, Tuple[int, int, int, int, int]]]:
@@ -604,9 +764,13 @@ def _stage_credentials(
     truncating silently if the source exceeds ``policy.MAX_CREDENTIAL_BYTES``.
     Never logs the copied content. Returns ``(private_dir, staged_path,
     snapshot)``; the caller must remove ``private_dir`` (via
-    ``_remove_staging_dir``) in a ``finally`` on every exit path.
+    ``_remove_staging_dir``) in a ``finally`` on every exit path. Also
+    opportunistically reaps other, unrelated staging directories proven
+    stale (see ``reap_stale_staging_dirs``) so a crashed prior worker's
+    leftovers do not accumulate forever.
     """
     _validate_staging_root()
+    reap_stale_staging_dirs()
     private_dir = tempfile.mkdtemp(dir=_policy.CREDENTIAL_STAGING_ROOT)
     os.chmod(private_dir, _STAGING_DIR_MODE)
     staged_path = os.path.join(private_dir, "credentials.json")
@@ -995,16 +1159,70 @@ def _run_subprocess(
     )
 
 
+#: Bounded verification that a force-removed container is actually gone —
+#: closes the "no orphan workers" requirement: docker's client-side timeout
+#: kills the ``docker run`` process but does not guarantee the daemon-side
+#: container has actually exited, and ``docker rm --force`` itself can
+#: return success while the container is still tearing down. A small,
+#: fixed number of short polls, never an unbounded wait.
+_CONTAINER_REMOVAL_VERIFY_ATTEMPTS = 3
+_CONTAINER_REMOVAL_VERIFY_SLEEP_SECONDS = 1.0
+
+
+def _container_still_exists(container_id: str, env: Dict[str, str]) -> Optional[bool]:
+    """``True``/``False`` if docker could answer whether *container_id*
+    still exists, or ``None`` if docker itself could not be asked (trust
+    check failed, daemon unreachable, timeout, nonzero/malformed result) —
+    treated as "cannot confirm" by the caller, never as "gone".
+
+    Uses ``docker container ls -a --filter id=<id>`` rather than ``docker
+    inspect``: ``inspect``'s exit code alone cannot distinguish "confirmed
+    absent" from "daemon error" — both are nonzero. ``container ls`` exits 0
+    in both cases, so its exit code carries no ambiguity, and the actual
+    answer is read from stdout: an exact (``--no-trunc``) match on
+    *container_id* means present, empty output means confirmed absent. Any
+    unexpected/non-empty-but-non-matching output, a nonzero exit, or an
+    exception all resolve to "cannot confirm" — never "gone".
+    """
+    try:
+        _validate_docker_binary_trust()
+    except TrustViolation:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                *_docker_base_argv(), "container", "ls", "-a", "--no-trunc",
+                "--filter", f"id={container_id}", "--format", "{{.ID}}",
+            ],
+            capture_output=True, text=True, timeout=10, env=env,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+    if lines == [container_id]:
+        return True
+    if not lines:
+        return False
+    return None
+
+
 def _force_remove_container(
     cidfile: Path, env: Optional[Dict[str, str]] = None,
 ) -> None:
-    """Best-effort removal of the exact container created by one spawn.
+    """Force-remove the exact container created by one spawn, then verify —
+    within a bounded number of short polls — that it is actually gone.
 
     Docker's client-side timeout kills ``docker run`` but does not guarantee
     that the daemon-side container exits. The cidfile lives inside the
     root-owned per-spawn staging directory and must contain a full 64-character
     hexadecimal container id; task/model input can never select the removal
-    target. Cleanup never masks the worker's real result.
+    target. If removal cannot be confirmed within the bound, an explicit,
+    non-secret diagnostic (the container id, which is an opaque hex handle,
+    never a path or credential) is logged so an operator can act on a
+    possible orphan rather than one going unnoticed. Cleanup never masks
+    the worker's real result — every branch here only logs, never raises.
     """
     try:
         container_id = cidfile.read_text(encoding="ascii").strip()
@@ -1017,6 +1235,8 @@ def _force_remove_container(
         ):
             logger.error("claude_worker: refusing cleanup for malformed container cidfile")
             return
+
+        run_env = env or build_child_env()
         try:
             _validate_docker_binary_trust()
             subprocess.run(
@@ -1024,10 +1244,23 @@ def _force_remove_container(
                 capture_output=True,
                 text=True,
                 timeout=15,
-                env=env or build_child_env(),
+                env=run_env,
             )
         except Exception:
             logger.exception("claude_worker: failed to remove worker container %s", container_id)
+
+        for attempt in range(_CONTAINER_REMOVAL_VERIFY_ATTEMPTS):
+            still_exists = _container_still_exists(container_id, run_env)
+            if still_exists is False:
+                return
+            if attempt < _CONTAINER_REMOVAL_VERIFY_ATTEMPTS - 1:
+                time.sleep(_CONTAINER_REMOVAL_VERIFY_SLEEP_SECONDS)
+        logger.error(
+            "claude_worker: could not confirm removal of sandbox container %s after "
+            "%d attempt(s) — it may still be running; a manual "
+            "`docker rm --force %s` may be required to avoid an orphaned worker",
+            container_id, _CONTAINER_REMOVAL_VERIFY_ATTEMPTS, container_id,
+        )
     finally:
         try:
             cidfile.unlink(missing_ok=True)
@@ -1427,6 +1660,112 @@ def _parse_worker_summary(stdout: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Bounded, redacted failure diagnostics for telemetry
+#
+# The 2026-09-07/08 incident: telemetry had no stderr and the agent-visible
+# tool result truncates before anything actionable, so a run of "other"
+# failures at 03:50-04:41 UTC left no trail to diagnose from. These helpers
+# build a SMALL, best-effort diagnostic — never the full stdout/stderr, never
+# the task prompt, never an unbounded string — that ``run_worker`` threads
+# into telemetry only (never into the caller-facing tool result, which
+# already carries a coarse ``failure_class``). Redaction happens HERE, before
+# the excerpt is ever handed to telemetry: absolute-path-looking substrings
+# are scrubbed and known secret/bearer/API-key SHAPES (not just named
+# fields — the same pattern ``telemetry.py`` already trusts for its own
+# scan) are replaced, both before the excerpt is truncated and before the
+# fingerprint is computed. ``telemetry.append_record``'s own secret scan
+# independently re-applies the same redaction as defense in depth, not as
+# the only line of defense.
+# ---------------------------------------------------------------------------
+
+_MAX_ERROR_EXCERPT_CHARS = 300
+_ABS_PATH_PATTERN = re.compile(r"/(?:[\w.\-]+/)+[\w.\-]+")
+
+#: The same alternate spellings a real ``claude --output-format json`` error
+#: body's numeric HTTP status can arrive under — see
+#: ``breaker._STATUS_FIELD_NAMES``. Kept as an independent literal (not a
+#: shared import) so this best-effort diagnostic extractor can never change
+#: breaker's own classification behavior, and vice versa.
+_DIAGNOSTIC_STATUS_FIELD_NAMES = ("api_error_status", "status", "status_code", "code")
+
+
+def _scrub_paths(text: str) -> str:
+    return _ABS_PATH_PATTERN.sub("[PATH]", text)
+
+
+def _status_from_parsed(parsed: Dict[str, Any]) -> Optional[int]:
+    for source in (parsed, parsed.get("error")):
+        if not isinstance(source, dict):
+            continue
+        for key in _DIAGNOSTIC_STATUS_FIELD_NAMES:
+            value = source.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+    return None
+
+
+def _bounded_diagnostic(source: str, text: str, api_error_status: Optional[int] = None) -> Dict[str, Any]:
+    """Build the one small, redacted, bounded diagnostic object shape.
+
+    Order matters: scrub filesystem paths, then redact secret/bearer/API-key
+    SHAPED substrings, THEN truncate to the excerpt bound, and finally
+    fingerprint the already-redacted, already-truncated, already-normalized
+    excerpt — never the raw input — so the fingerprint can never itself
+    encode something that was redacted, and two failures that differ only in
+    the part that got truncated away fingerprint identically.
+    """
+    scrubbed = _scrub_paths(text) if text else ""
+    redacted = _telemetry.redact_secret_shapes(scrubbed) if scrubbed else ""
+    excerpt = redacted[:_MAX_ERROR_EXCERPT_CHARS]
+    normalized = f"{source}|{api_error_status}|{excerpt}"
+    fingerprint = _telemetry.hash_value(normalized) if (source or excerpt) else ""
+    return {
+        "error_source": source,
+        "error_excerpt": excerpt,
+        "error_fingerprint": fingerprint,
+        "api_error_status": api_error_status,
+    }
+
+
+def _diagnostics_from_text(source: str, text: str) -> Dict[str, Any]:
+    """Bounded diagnostic from a plain exception/refusal message — never the
+    task text, never raw stdout/stderr."""
+    return _bounded_diagnostic(source, text or "")
+
+
+def _diagnostics_from_spawn(stdout: str, stderr: str) -> Dict[str, Any]:
+    """Bounded diagnostic from a failed spawn's captured stdout/stderr.
+
+    Prefers stderr when present (the traditional Unix error channel);
+    otherwise best-effort parses ``--output-format json`` stdout for a
+    structured numeric HTTP status (``api_error_status`` or one of the
+    alternate spellings real CLI error bodies have also been observed to
+    use — see :data:`_DIAGNOSTIC_STATUS_FIELD_NAMES`) and the ``result`` text
+    specifically — never the whole stdout blob — so the excerpt stays small
+    even though the full (bounded-to-200k-char) stdout is much larger.
+    """
+    if stderr:
+        return _bounded_diagnostic("stderr", stderr)
+    if not stdout:
+        return _bounded_diagnostic("", "")
+
+    api_error_status: Optional[int] = None
+    text = stdout
+    source = "stdout"
+    try:
+        parsed = json.loads(stdout)
+    except (ValueError, TypeError):
+        parsed = None
+    if isinstance(parsed, dict):
+        api_error_status = _status_from_parsed(parsed)
+        result_text = parsed.get("result")
+        if isinstance(result_text, str):
+            text = result_text
+            source = "stdout_json_result"
+    return _bounded_diagnostic(source, text, api_error_status)
+
+
+# ---------------------------------------------------------------------------
 # Orchestration — the claude_worker tool handler
 # ---------------------------------------------------------------------------
 
@@ -1435,6 +1774,74 @@ _GENERIC_ERROR = (
     "claude_worker failed with an internal error; details were withheld from "
     "the result and the run was recorded in telemetry."
 )
+
+# ---------------------------------------------------------------------------
+# Validation status — Bash is deliberately denied/unavailable inside the
+# sandboxed worker (see ``policy.CLAUDE_DENIED_TOOLS``), so the worker can
+# never run a test suite itself. A successful spawn (exit 0) proves only
+# that the isolated Claude CLI process exited cleanly — never that any code
+# it touched is correct. Claude's own prose (``summary``) and the observed
+# ``files_touched`` are self-report/evidence, not test verification, and
+# NEITHER is ever consulted below: the only thing that can move a result off
+# "unverified" is a trusted, operator-configured verifier command that this
+# module itself runs, in its own network-isolated, credential-less
+# container, and inspects for a real process exit code.
+# ---------------------------------------------------------------------------
+
+#: No trusted verifier ran (not configured, not enabled, or the spawn itself
+#: did not succeed) — the parent must independently verify before trusting
+#: the result. This is the closed default: see ``_finish``'s ``setdefault``.
+VALIDATION_STATUS_UNVERIFIED = "unverified"
+
+#: The operator-configured ``verification.command`` ran in the sandbox and
+#: exited 0. Represented distinctly from "unverified" so a caller can tell
+#: "a real command actually ran and passed" apart from "nothing checked
+#: this" — both would otherwise collapse into the same ``success: true``.
+VALIDATION_STATUS_VERIFIED = "verified_by_configured_verifier"
+
+#: The operator-configured verifier ran but did not pass (nonzero exit,
+#: timeout, or the sandbox itself could not run it). Still requires parent
+#: verification — this is evidence of a problem, not proof of one.
+VALIDATION_STATUS_VERIFICATION_FAILED = "verification_failed"
+
+
+def _resolve_validation_status(
+    cfg: Dict[str, Any], resolved_cwd: str, task_succeeded: bool,
+) -> Tuple[str, bool, Optional[Dict[str, Any]]]:
+    """Return ``(validation_status, parent_verification_required,
+    verification_result)`` for one ``claude_worker`` call.
+
+    Fails closed to ``VALIDATION_STATUS_UNVERIFIED`` /
+    ``parent_verification_required=True`` unless BOTH
+    ``verification.enabled`` is ``True`` and ``verification.command`` is a
+    non-empty configured argv — an operator opt-in, never something a task
+    description or the worker's own output can trigger. When configured,
+    the command is run for real (``run_verification_command``, the same
+    hardened, network-isolated, credential-less container used elsewhere in
+    this module) and only its actual exit code decides the outcome; no
+    stdout text — from the verifier OR from the worker's own run — is
+    parsed for phrases like "tests pass".
+
+    The verifier's timeout is the fixed ``policy.VERIFICATION_TIMEOUT_SECONDS``
+    — never the operator-configured ``isolation.timeout_seconds`` (which can
+    be as high as 900s) — bounded further by the isolation timeout when that
+    is the shorter of the two, so verification is never given more time than
+    the worker's own isolated run was allowed.
+    """
+    if not task_succeeded:
+        return VALIDATION_STATUS_UNVERIFIED, True, None
+
+    verification_cfg = cfg.get("verification") or {}
+    command = verification_cfg.get("command") or []
+    if verification_cfg.get("enabled") is not True or not command:
+        return VALIDATION_STATUS_UNVERIFIED, True, None
+
+    isolation_timeout_seconds = float((cfg.get("isolation") or {}).get("timeout_seconds", 900))
+    timeout_seconds = min(_policy.VERIFICATION_TIMEOUT_SECONDS, isolation_timeout_seconds)
+    result = run_verification_command(resolved_cwd, list(command), timeout_seconds)
+    if isinstance(result, dict) and result.get("ok") is True:
+        return VALIDATION_STATUS_VERIFIED, False, result
+    return VALIDATION_STATUS_VERIFICATION_FAILED, True, result
 
 
 def run_worker(
@@ -1479,13 +1886,21 @@ def run_worker(
 
     emitted = {"telemetry": False}
 
-    def _finish(payload: Dict[str, Any]) -> str:
+    def _finish(payload: Dict[str, Any], diagnostic: Optional[Dict[str, Any]] = None) -> str:
         payload.setdefault("session_id", session_key)
         payload.setdefault("cwd", cwd_arg if isinstance(cwd_arg, str) else "")
         payload.setdefault("review", None)
         payload.setdefault("status", "ok" if payload.get("success") else "failed")
         payload.setdefault("fallback_ready", False)
         payload.setdefault("fallback", None)
+        # Fail-closed default: Bash is unavailable inside the sandboxed
+        # worker, so unless a trusted operator-configured verifier actually
+        # ran and passed (see ``_resolve_validation_status``), a result must
+        # never read as more than self-reported prose/``files_touched`` —
+        # never as proven-correct.
+        payload.setdefault("validation_status", VALIDATION_STATUS_UNVERIFIED)
+        payload.setdefault("parent_verification_required", True)
+        payload.setdefault("verification", None)
         if not emitted["telemetry"]:
             emitted["telemetry"] = True
             record = _telemetry.build_record(
@@ -1503,6 +1918,7 @@ def run_worker(
                 cwd=payload.get("cwd") or "",
                 files_touched=payload.get("files_touched") or [],
                 success=bool(payload.get("success")),
+                diagnostic=diagnostic,
             )
             _telemetry.append_record(
                 record, configured_path=(cfg.get("telemetry") or {}).get("path", "")
@@ -1531,6 +1947,14 @@ def run_worker(
         task = args.get("task") if isinstance(args, dict) else None
         cwd_arg = args.get("cwd") if isinstance(args, dict) else None
         complexity = args.get("complexity") if isinstance(args, dict) else None
+        # ``routing.choose_model`` itself is the single source of truth for
+        # what counts as authorization (``allow_opus is True``, nothing
+        # else) — the raw value is passed through unchanged rather than
+        # coerced here, so a caller that omits it, or sends a truthy
+        # non-``True`` value, is guaranteed to land on Sonnet exactly the
+        # way ``routing.py``'s own tests pin down, with no second place this
+        # logic could drift from that contract.
+        allow_opus = args.get("allow_opus") if isinstance(args, dict) else None
         allow_fallback = isinstance(args, dict) and args.get("allow_terra_fallback") is True
 
         if not isinstance(task, str) or not task.strip():
@@ -1573,6 +1997,7 @@ def run_worker(
 
         outcome = _run_attempts(
             task=task, cwd=resolved_cwd, complexity=complexity, cfg=cfg,
+            allow_opus=allow_opus,
         )
 
         after_files = _git_changed_files(resolved_cwd)
@@ -1589,6 +2014,10 @@ def run_worker(
                 review_result = run_review(
                     task=task, files_touched=files_touched, summary=outcome["summary"],
                 )
+
+        validation_status, parent_verification_required, verification_result = (
+            _resolve_validation_status(cfg, resolved_cwd, outcome["success"])
+        )
 
         final_open_classes = _breaker.open_classes()
         payload: Dict[str, Any] = {
@@ -1607,13 +2036,33 @@ def run_worker(
             "files_touched": files_touched,
             "summary": outcome["summary"],
             "review": review_result,
+            "validation_status": validation_status,
+            "parent_verification_required": parent_verification_required,
+            "verification": verification_result,
         }
         if not outcome["success"]:
-            payload["error"] = (
-                f"claude_worker failed after {outcome['attempts']} attempt(s): "
-                f"{outcome['failure_class']}"
-            )
-        return _finish(payload)
+            if outcome["failure_class"] == _breaker.AUTH_PREFLIGHT_FAILURE_CLASS:
+                # The post-spawn counterpart of ``_oauth_preflight_hold_payload``:
+                # the CLI itself reported a stale/revoked OAuth SESSION (a
+                # structured signal a local freshness check cannot see — the
+                # credential file can look unexpired while the server has
+                # already rejected it). Same operator vocabulary, same
+                # "no breaker was opened, waiting will not fix this" framing.
+                payload["error"] = (
+                    "claude_worker failed: the Claude OAuth session appears expired "
+                    "or revoked. No circuit breaker was opened — waiting will not "
+                    "fix this. Re-authenticate the host Claude Code session and call "
+                    "claude_worker again."
+                )
+            else:
+                payload["error"] = (
+                    f"claude_worker failed after {outcome['attempts']} attempt(s): "
+                    f"{outcome['failure_class']}"
+                )
+        return _finish(
+            payload,
+            diagnostic=None if outcome["success"] else outcome.get("diagnostic"),
+        )
     except Exception:
         # Anything unexpected: one redacted result, one telemetry record.
         # The exception text itself is logged, not returned — it can quote a
@@ -1626,6 +2075,9 @@ def run_worker(
             return tool_result({
                 "success": False, "status": "failed", "failure_class": "internal_error",
                 "error": _GENERIC_ERROR,
+                "validation_status": VALIDATION_STATUS_UNVERIFIED,
+                "parent_verification_required": True,
+                "verification": None,
             })
 
 
@@ -1775,12 +2227,13 @@ def _breaker_open_payload(
 
 def _run_attempts(
     task: str, cwd: str, complexity: Optional[str], cfg: Dict[str, Any],
+    allow_opus: Any = False,
 ) -> Dict[str, Any]:
     """Run at most ``policy.MAX_ATTEMPTS`` spawns and summarize the outcome.
 
-    The cap is the ``range`` bound AND ``routing.choose_model``'s own
-    structural refusal — two independent enforcements of "no third spawn",
-    neither of which is reachable from configuration.
+    The cap is the ``range`` bound above, which is ``1`` — there is no
+    failure-driven retry or escalation (see ``policy.MAX_ATTEMPTS`` and
+    ``routing.py``) — and is not reachable from configuration.
     """
     timeout_seconds = (cfg.get("isolation") or {}).get("timeout_seconds", 900)
 
@@ -1792,6 +2245,7 @@ def _run_attempts(
     duration_ms = 0
     success = False
     summary = ""
+    diagnostic: Optional[Dict[str, Any]] = None
 
     for attempt in range(_policy.MAX_ATTEMPTS):
         if attempt > 0 and _breaker.is_open():
@@ -1808,13 +2262,21 @@ def _run_attempts(
         )
 
         try:
+            # ``routing.choose_model`` takes no ``attempt``/
+            # ``previous_failure_class`` — there is no failure-driven
+            # escalation any more (see ``policy.MAX_ATTEMPTS`` and
+            # ``routing.py``'s own docstring): every call here routes
+            # identically, and the ``range`` bound above is the only cap.
+            # ``allow_opus`` is passed through verbatim: only the literal
+            # ``True`` (never a truthy non-bool) combined with an allowed
+            # ``complexity`` can select Opus — see ``routing.choose_model``.
             model, route_reason = _routing.choose_model(
-                task=task, attempt=attempt, complexity=complexity,
-                previous_failure_class=previous_failure_class,
+                task=task, complexity=complexity, allow_opus=allow_opus,
             )
         except RuntimeError:
-            # Routing refused this attempt (cap reached, breaker-class
-            # failure, or a task that already started on Opus).
+            # Defensive: routing.choose_model does not currently raise this,
+            # but a refusal here must still stop the loop rather than spawn
+            # with an unresolved model.
             break
 
         try:
@@ -1845,6 +2307,11 @@ def _run_attempts(
         previous_failure_class = (
             "timeout" if timed_out else _breaker.classify_failure(exit_code, stderr, stdout)
         )
+        # Bounded, redacted evidence for THIS attempt's failure — see the
+        # module-level "Bounded, redacted failure diagnostics" section below.
+        # Overwritten (never accumulated) on every failing attempt, so only
+        # the most recent attempt's evidence survives to the caller.
+        diagnostic = _diagnostics_from_spawn(stdout, stderr)
         if previous_failure_class in _breaker.BREAKER_CLASSES:
             _breaker.record_failure(
                 previous_failure_class,
@@ -1862,4 +2329,5 @@ def _run_attempts(
         "duration_ms": duration_ms,
         "failure_class": previous_failure_class,
         "summary": summary,
+        "diagnostic": None if success else diagnostic,
     }

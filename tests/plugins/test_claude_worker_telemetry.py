@@ -381,3 +381,128 @@ class TestBuildRecord:
         )
         assert set(record.keys()) <= set(telemetry.SAFE_FIELDS)
         assert record["success"] is True
+
+    def test_diagnostic_defaults_to_none(self):
+        """Success/preflight/refusal callers never pass a diagnostic — it
+        must not be fabricated as a default."""
+        record = telemetry.build_record(session_id="sess:1", success=True)
+        assert record["diagnostic"] is None
+
+
+class TestRedactSecretShapes:
+    def test_a_secret_shaped_substring_is_replaced_in_place(self):
+        out = telemetry.redact_secret_shapes(
+            "auth failed with sk-ant-api03-AAAABBBBCCCCDDDDEEEEFFFF today",
+        )
+        assert "sk-ant-api03-AAAABBBBCCCCDDDDEEEEFFFF" not in out
+        assert "[REDACTED]" in out
+        # Surrounding context survives — this is a targeted substitution,
+        # not the field-level all-or-nothing drop ``_safe_scalar`` uses.
+        assert out.startswith("auth failed with")
+        assert out.endswith("today")
+
+    def test_text_with_no_secret_shape_is_unchanged(self):
+        assert telemetry.redact_secret_shapes("plain error text") == "plain error text"
+
+    @pytest.mark.parametrize("value", [None, 123, ""], ids=["none", "int", "empty"])
+    def test_non_string_or_empty_input_is_harmless(self, value):
+        telemetry.redact_secret_shapes(value)  # must not raise
+
+    def test_multiple_secrets_in_one_string_are_all_replaced(self):
+        out = telemetry.redact_secret_shapes(
+            "a=sk-ant-api03-AAAABBBBCCCCDDDDEEEEFFFF b=ghp_1234567890abcdef1234567890abcdef",
+        )
+        assert "sk-ant-api03" not in out
+        assert "ghp_1234567890" not in out
+        assert out.count("[REDACTED]") == 2
+
+
+class TestDiagnosticFieldSanitization:
+    def _diag(self, **overrides):
+        base = {
+            "error_source": "stderr", "error_excerpt": "Traceback: it broke",
+            "error_fingerprint": "sha256:deadbeefcafefeed", "api_error_status": None,
+        }
+        base.update(overrides)
+        return base
+
+    def test_a_well_formed_diagnostic_round_trips(self, _home):
+        telemetry.append_record({
+            "session_id": "sess:1", "success": False, "diagnostic": self._diag(),
+        })
+        line = _read_lines(_primary_path(_home))[0]
+        assert line["diagnostic"] == {
+            "error_source": "stderr", "error_excerpt": "Traceback: it broke",
+            "error_fingerprint": "sha256:deadbeefcafefeed", "api_error_status": None,
+        }
+
+    def test_success_and_preflight_paths_carry_no_diagnostic(self, _home):
+        telemetry.append_record(
+            telemetry.build_record(session_id="sess:1", success=True),
+        )
+        line = _read_lines(_primary_path(_home))[0]
+        assert line["diagnostic"] is None
+
+    def test_a_non_dict_diagnostic_sanitizes_to_none(self, _home):
+        telemetry.append_record({"session_id": "sess:1", "diagnostic": "not a dict"})
+        line = _read_lines(_primary_path(_home))[0]
+        assert line["diagnostic"] is None
+
+    def test_diagnostic_excerpt_is_independently_redacted_again(self, _home):
+        """Even if a caller's own redaction were somehow bypassed, telemetry
+        re-scans the excerpt itself — defense in depth, not trust."""
+        telemetry.append_record({
+            "session_id": "sess:1",
+            "diagnostic": self._diag(
+                error_excerpt="key leaked: sk-ant-api03-AAAABBBBCCCCDDDDEEEEFFFF",
+            ),
+        })
+        line = _read_lines(_primary_path(_home))[0]
+        assert "sk-ant-api03" not in json.dumps(line)
+        assert "[REDACTED]" in line["diagnostic"]["error_excerpt"]
+
+    def test_diagnostic_excerpt_is_independently_bounded_again(self, _home):
+        telemetry.append_record({
+            "session_id": "sess:1",
+            "diagnostic": self._diag(error_excerpt="x" * 5000),
+        })
+        line = _read_lines(_primary_path(_home))[0]
+        assert len(line["diagnostic"]["error_excerpt"]) <= telemetry._MAX_DIAGNOSTIC_EXCERPT_CHARS
+
+    def test_a_non_integer_api_error_status_is_dropped_not_passed_through(self, _home):
+        telemetry.append_record({
+            "session_id": "sess:1", "diagnostic": self._diag(api_error_status="401"),
+        })
+        line = _read_lines(_primary_path(_home))[0]
+        assert line["diagnostic"]["api_error_status"] is None
+
+    def test_a_boolean_api_error_status_is_dropped_not_treated_as_an_int(self, _home):
+        telemetry.append_record({
+            "session_id": "sess:1", "diagnostic": self._diag(api_error_status=True),
+        })
+        line = _read_lines(_primary_path(_home))[0]
+        assert line["diagnostic"]["api_error_status"] is None
+
+    def test_a_real_integer_api_error_status_survives(self, _home):
+        telemetry.append_record({
+            "session_id": "sess:1", "diagnostic": self._diag(api_error_status=500),
+        })
+        line = _read_lines(_primary_path(_home))[0]
+        assert line["diagnostic"]["api_error_status"] == 500
+
+    def test_extra_keys_on_a_diagnostic_object_are_dropped(self, _home):
+        telemetry.append_record({
+            "session_id": "sess:1",
+            "diagnostic": self._diag(raw_stdout="the entire captured stdout blob"),
+        })
+        line = _read_lines(_primary_path(_home))[0]
+        assert "raw_stdout" not in line["diagnostic"]
+        assert set(line["diagnostic"]) == {
+            "error_source", "error_excerpt", "error_fingerprint", "api_error_status",
+        }
+
+    def test_a_diagnostic_never_breaks_the_one_record_per_invocation_guarantee(self, _home):
+        telemetry.append_record({
+            "session_id": "sess:1", "diagnostic": {"error_excerpt": object()},
+        })
+        assert len(_read_lines(_primary_path(_home))) == 1

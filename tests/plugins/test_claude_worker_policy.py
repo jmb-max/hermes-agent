@@ -115,8 +115,13 @@ class TestImmutableModels:
     def test_allowlist_is_exactly_two_models(self):
         assert policy.MODEL_ALLOWLIST == frozenset({"claude-sonnet-5", "claude-opus-5"})
 
-    def test_max_attempts_is_two(self):
-        assert policy.MAX_ATTEMPTS == 2
+    def test_max_attempts_is_one(self):
+        """Exactly one spawn per call — no retry, no post-failure escalation."""
+        assert policy.MAX_ATTEMPTS == 1
+
+    def test_verification_timeout_is_bounded(self):
+        assert isinstance(policy.VERIFICATION_TIMEOUT_SECONDS, int)
+        assert 0 < policy.VERIFICATION_TIMEOUT_SECONDS <= 3600
 
     def test_no_config_lookup_in_policy_module(self):
         source = open(policy.__file__, encoding="utf-8").read()

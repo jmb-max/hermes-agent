@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 import stat
+import time
 from pathlib import Path
 
 import pytest
@@ -767,6 +768,74 @@ class TestSpawnPlumbing:
         assert result["exit_code"] is None
         assert removed == ["a" * 64]
 
+    def test_container_cleanup_runs_on_success(self, monkeypatch, repo):
+        removed = []
+        monkeypatch.setattr(
+            runner, "_force_remove_container",
+            lambda cidfile, env=None: removed.append(cidfile.read_text().strip()),
+        )
+
+        def _success(cmd, *args, **kwargs):
+            cidfile = Path(cmd[cmd.index("--cidfile") + 1])
+            cidfile.write_text("1" * 64, encoding="ascii")
+
+            class _Completed:
+                returncode = 0
+                stdout = json.dumps({"result": "done"})
+                stderr = ""
+
+            return _Completed()
+
+        monkeypatch.setattr(runner, "_run_subprocess", _success)
+        result = runner.spawn_claude(task="t", cwd=str(repo), model="claude-sonnet-5", timeout_seconds=5)
+        assert result["exit_code"] == 0
+        assert removed == ["1" * 64]
+
+    def test_container_cleanup_runs_on_nonzero_exit(self, monkeypatch, repo):
+        removed = []
+        monkeypatch.setattr(
+            runner, "_force_remove_container",
+            lambda cidfile, env=None: removed.append(cidfile.read_text().strip()),
+        )
+
+        def _failed(cmd, *args, **kwargs):
+            cidfile = Path(cmd[cmd.index("--cidfile") + 1])
+            cidfile.write_text("2" * 64, encoding="ascii")
+
+            class _Completed:
+                returncode = 1
+                stdout = ""
+                stderr = "boom"
+
+            return _Completed()
+
+        monkeypatch.setattr(runner, "_run_subprocess", _failed)
+        result = runner.spawn_claude(task="t", cwd=str(repo), model="claude-sonnet-5", timeout_seconds=5)
+        assert result["exit_code"] == 1
+        assert removed == ["2" * 64]
+
+    def test_one_spawn_invocation_starts_exactly_one_container(self, monkeypatch, repo):
+        """One ``spawn_claude`` call must build and run exactly one ``docker
+        run`` — never an internal retry that would leave a second, unrelated
+        container behind."""
+        calls = []
+
+        def _fake_run(cmd, **kwargs):
+            calls.append(cmd)
+
+            class _Completed:
+                returncode = 0
+                stdout = json.dumps({"result": "done"})
+                stderr = ""
+
+            return _Completed()
+
+        monkeypatch.setattr(runner, "_run_subprocess", _fake_run)
+        runner.spawn_claude(task="t", cwd=str(repo), model="claude-sonnet-5", timeout_seconds=5)
+        assert len(calls) == 1
+        cidfiles = [_opt_values(cmd, "--cidfile") for cmd in calls]
+        assert all(len(c) == 1 for c in cidfiles)
+
     def test_no_temp_files_are_left_behind(self, monkeypatch, repo, tmp_path):
         scratch = tmp_path / "tmpdir"
         scratch.mkdir()
@@ -834,6 +903,364 @@ class TestSpawnPlumbing:
         assert str(creds) not in " ".join(captured["cmd"])
 
 
+class TestContainerRemovalVerification:
+    """``_force_remove_container`` must not just fire ``docker rm --force``
+    and hope: it verifies — within a small bounded number of polls, never an
+    unbounded wait — that the exact container is actually gone, and logs an
+    explicit, non-secret diagnostic (just the opaque container id) if it
+    cannot confirm that within the bound. No orphan worker should go
+    unnoticed."""
+
+    @staticmethod
+    def _cidfile(tmp_path, container_id="a" * 64):
+        path = tmp_path / "container.cid"
+        path.write_text(container_id, encoding="ascii")
+        return path
+
+    @pytest.fixture(autouse=True)
+    def _no_real_sleep(self, monkeypatch):
+        monkeypatch.setattr(runner.time, "sleep", lambda seconds: None)
+
+    def test_confirmed_removal_after_one_poll_logs_no_error(self, tmp_path, monkeypatch, caplog):
+        cidfile = self._cidfile(tmp_path)
+        rm_calls = []
+
+        def _fake_run(cmd, **kwargs):
+            class _Completed:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            if "rm" in cmd:
+                rm_calls.append(cmd)
+            return _Completed()
+
+        monkeypatch.setattr(runner.subprocess, "run", _fake_run)
+        monkeypatch.setattr(runner, "_container_still_exists", lambda cid, env: False)
+
+        import logging
+
+        with caplog.at_level(logging.ERROR, logger=runner.logger.name):
+            runner._force_remove_container(cidfile, env={})
+
+        assert not any("could not confirm removal" in rec.message for rec in caplog.records)
+        assert not cidfile.exists()
+
+    def test_unconfirmed_removal_logs_an_explicit_diagnostic(self, tmp_path, monkeypatch, caplog):
+        cidfile = self._cidfile(tmp_path, "b" * 64)
+        monkeypatch.setattr(runner.subprocess, "run", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_container_still_exists", lambda cid, env: True)
+
+        import logging
+
+        with caplog.at_level(logging.ERROR, logger=runner.logger.name):
+            runner._force_remove_container(cidfile, env={})
+
+        messages = " ".join(rec.message for rec in caplog.records)
+        assert "could not confirm removal" in messages
+        assert "b" * 64 in messages
+        # cleanup never masks the real outcome: the cidfile is still removed
+        # even when removal could not be confirmed.
+        assert not cidfile.exists()
+
+    def test_verification_is_bounded_not_unbounded(self, tmp_path, monkeypatch):
+        cidfile = self._cidfile(tmp_path, "c" * 64)
+        monkeypatch.setattr(runner.subprocess, "run", lambda *a, **k: None)
+        calls = {"n": 0}
+
+        def _always_exists(cid, env):
+            calls["n"] += 1
+            return True
+
+        monkeypatch.setattr(runner, "_container_still_exists", _always_exists)
+        runner._force_remove_container(cidfile, env={})
+        assert calls["n"] == runner._CONTAINER_REMOVAL_VERIFY_ATTEMPTS
+
+    def test_docker_unreachable_during_verification_is_treated_as_unconfirmed(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        """``_container_still_exists`` returning ``None`` (docker itself
+        could not be asked) must never be read as "confirmed gone"."""
+        cidfile = self._cidfile(tmp_path, "d" * 64)
+        monkeypatch.setattr(runner.subprocess, "run", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_container_still_exists", lambda cid, env: None)
+
+        import logging
+
+        with caplog.at_level(logging.ERROR, logger=runner.logger.name):
+            runner._force_remove_container(cidfile, env={})
+
+        assert any("could not confirm removal" in rec.message for rec in caplog.records)
+
+    def test_never_raises_on_any_docker_failure(self, tmp_path, monkeypatch):
+        cidfile = self._cidfile(tmp_path, "e" * 64)
+
+        def _boom(*a, **k):
+            raise OSError("docker vanished")
+
+        monkeypatch.setattr(runner.subprocess, "run", _boom)
+        runner._force_remove_container(cidfile, env={})  # must not raise
+        assert not cidfile.exists()
+
+    def test_malformed_container_id_refuses_cleanup_without_calling_docker(
+        self, tmp_path, monkeypatch,
+    ):
+        cidfile = tmp_path / "container.cid"
+        cidfile.write_text("not-a-hex-id", encoding="ascii")
+        calls = []
+        monkeypatch.setattr(runner.subprocess, "run", lambda *a, **k: calls.append(1))
+        runner._force_remove_container(cidfile, env={})
+        assert calls == []
+
+    def test_missing_cidfile_is_a_silent_noop_without_calling_docker(self, tmp_path, monkeypatch):
+        """Docker never got far enough to write the cidfile (preflight/
+        command-build failure before the subprocess call) — there is no
+        container to remove, and this must not raise or invoke docker."""
+        cidfile = tmp_path / "container.cid"
+        assert not cidfile.exists()
+        calls = []
+        monkeypatch.setattr(runner.subprocess, "run", lambda *a, **k: calls.append(1))
+        runner._force_remove_container(cidfile, env={})  # must not raise
+        assert calls == []
+
+
+class TestContainerStillExistsQuery:
+    """``_container_still_exists`` must distinguish a confirmed-absent
+    container from "docker itself could not answer" — a bare nonzero
+    ``docker inspect`` exit conflates the two (a daemon error and "not
+    found" both exit nonzero), so the query used here (``docker container
+    ls -a --filter id=<id>``) exits 0 in both cases and the real answer is
+    read from stdout via an exact, ``--no-trunc`` line comparison."""
+
+    _CID = "f" * 64
+
+    @pytest.fixture(autouse=True)
+    def _trusted_docker_binary(self, monkeypatch):
+        monkeypatch.setattr(runner, "_validate_docker_binary_trust", lambda: {})
+
+    def test_present_container_returns_true(self, monkeypatch):
+        class _Completed:
+            returncode = 0
+            stdout = f"{self._CID}\n"
+            stderr = ""
+
+        monkeypatch.setattr(runner.subprocess, "run", lambda *a, **k: _Completed())
+        assert runner._container_still_exists(self._CID, env={}) is True
+
+    def test_confirmed_absent_container_returns_false(self, monkeypatch):
+        class _Completed:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        monkeypatch.setattr(runner.subprocess, "run", lambda *a, **k: _Completed())
+        assert runner._container_still_exists(self._CID, env={}) is False
+
+    def test_daemon_error_nonzero_exit_returns_none_not_absent(self, monkeypatch):
+        """A nonzero exit is a daemon/CLI error, never proof the container
+        is gone — that must resolve to "cannot confirm", not "absent"."""
+        class _Completed:
+            returncode = 1
+            stdout = ""
+            stderr = "Cannot connect to the Docker daemon"
+
+        monkeypatch.setattr(runner.subprocess, "run", lambda *a, **k: _Completed())
+        assert runner._container_still_exists(self._CID, env={}) is None
+
+    def test_subprocess_exception_returns_none(self, monkeypatch):
+        def _boom(*a, **k):
+            raise OSError("docker vanished")
+
+        monkeypatch.setattr(runner.subprocess, "run", _boom)
+        assert runner._container_still_exists(self._CID, env={}) is None
+
+    def test_trust_violation_returns_none_without_calling_docker(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(runner.subprocess, "run", lambda *a, **k: calls.append(1))
+
+        def _raise_trust_violation():
+            raise runner.TrustViolation("untrusted docker binary")
+
+        monkeypatch.setattr(runner, "_validate_docker_binary_trust", _raise_trust_violation)
+        assert runner._container_still_exists(self._CID, env={}) is None
+        assert calls == []
+
+    def test_unmatched_stdout_returns_none_not_present(self, monkeypatch):
+        """A substring filter match on a different container id must not be
+        read as "present" — only an exact full-id line counts."""
+        class _Completed:
+            returncode = 0
+            stdout = "a" * 64 + "\n"
+            stderr = ""
+
+        monkeypatch.setattr(runner.subprocess, "run", lambda *a, **k: _Completed())
+        assert runner._container_still_exists(self._CID, env={}) is None
+
+
+class TestStaleStagingReap:
+    """``reap_stale_staging_dirs`` closes the 2026-08-23/2026-09-07 gap: a
+    worker that never reaches ``spawn_claude``'s own ``finally`` (killed,
+    crashed, host reboot) leaves its staging directory behind forever.
+    Reaping is conservative by construction — only entries that are provably
+    stale, root-owned, of the exact expected shape, and (if they still
+    reference a container) confirmed to have no active container are ever
+    removed; anything else is left alone."""
+
+    @staticmethod
+    def _make_entry(
+        root, name="tmpabcd1234", *, age_seconds=None, mode=None,
+        owner=None, cidfile=None, credentials=True, extra_name=None,
+    ):
+        entry = root / name
+        entry.mkdir()
+        os.chmod(str(entry), runner._STAGING_DIR_MODE if mode is None else mode)
+        if owner is not None:
+            os.chown(str(entry), owner, owner)
+        if credentials:
+            (entry / runner._STAGED_CREDENTIALS_NAME).write_text("{}", encoding="utf-8")
+        if cidfile is not None:
+            (entry / runner._STAGED_CIDFILE_NAME).write_text(cidfile, encoding="ascii")
+        if extra_name is not None:
+            (entry / extra_name).write_text("x", encoding="utf-8")
+        if age_seconds is not None:
+            old = time.time() - age_seconds
+            os.utime(str(entry), (old, old))
+        return entry
+
+    @pytest.fixture()
+    def staging_root(self, tmp_path, monkeypatch):
+        root = tmp_path / "staging-root"
+        root.mkdir()
+        os.chmod(str(root), 0o700)
+        monkeypatch.setattr(policy, "CREDENTIAL_STAGING_ROOT", str(root))
+        return root
+
+    def test_removes_stale_directory_with_no_cidfile(self, staging_root):
+        entry = self._make_entry(
+            staging_root, age_seconds=runner._STALE_STAGING_MAX_AGE_SECONDS + 60,
+        )
+        runner.reap_stale_staging_dirs()
+        assert not entry.exists()
+
+    def test_leaves_recent_directory_alone(self, staging_root):
+        entry = self._make_entry(staging_root, age_seconds=60)
+        runner.reap_stale_staging_dirs()
+        assert entry.exists()
+
+    def test_leaves_directory_with_active_container_alone(self, staging_root, monkeypatch):
+        entry = self._make_entry(
+            staging_root, age_seconds=runner._STALE_STAGING_MAX_AGE_SECONDS + 60,
+            cidfile="a" * 64,
+        )
+        monkeypatch.setattr(runner, "_container_still_exists", lambda cid, env: True)
+        runner.reap_stale_staging_dirs()
+        assert entry.exists()
+
+    def test_removes_directory_with_confirmed_gone_container(self, staging_root, monkeypatch):
+        entry = self._make_entry(
+            staging_root, age_seconds=runner._STALE_STAGING_MAX_AGE_SECONDS + 60,
+            cidfile="b" * 64,
+        )
+        monkeypatch.setattr(runner, "_container_still_exists", lambda cid, env: False)
+        runner.reap_stale_staging_dirs()
+        assert not entry.exists()
+
+    def test_leaves_directory_alone_when_container_existence_is_unknown(self, staging_root, monkeypatch):
+        entry = self._make_entry(
+            staging_root, age_seconds=runner._STALE_STAGING_MAX_AGE_SECONDS + 60,
+            cidfile="c" * 64,
+        )
+        monkeypatch.setattr(runner, "_container_still_exists", lambda cid, env: None)
+        runner.reap_stale_staging_dirs()
+        assert entry.exists()
+
+    def test_leaves_directory_with_malformed_cidfile_alone(self, staging_root):
+        entry = self._make_entry(
+            staging_root, age_seconds=runner._STALE_STAGING_MAX_AGE_SECONDS + 60,
+            cidfile="not-a-hex-id",
+        )
+        runner.reap_stale_staging_dirs()
+        assert entry.exists()
+
+    def test_leaves_directory_with_unexpected_entries_alone(self, staging_root):
+        entry = self._make_entry(
+            staging_root, age_seconds=runner._STALE_STAGING_MAX_AGE_SECONDS + 60,
+            extra_name="notes.txt",
+        )
+        runner.reap_stale_staging_dirs()
+        assert entry.exists()
+
+    def test_leaves_symlinked_entry_alone(self, staging_root, tmp_path):
+        target = tmp_path / "elsewhere"
+        target.mkdir()
+        link = staging_root / "tmplink"
+        link.symlink_to(target)
+        runner.reap_stale_staging_dirs()
+        assert link.exists()
+
+    def test_leaves_non_root_owned_directory_alone(self, staging_root):
+        entry = self._make_entry(
+            staging_root, age_seconds=runner._STALE_STAGING_MAX_AGE_SECONDS + 60,
+            owner=policy.SANDBOX_UID,
+        )
+        runner.reap_stale_staging_dirs()
+        assert entry.exists()
+
+    def test_leaves_wrong_mode_directory_alone(self, staging_root):
+        entry = self._make_entry(
+            staging_root, age_seconds=runner._STALE_STAGING_MAX_AGE_SECONDS + 60,
+            mode=0o755,
+        )
+        runner.reap_stale_staging_dirs()
+        assert entry.exists()
+
+    def test_reap_is_bounded_to_max_entries(self, staging_root):
+        total = runner._STALE_STAGING_REAP_MAX_ENTRIES + 5
+        entries = [
+            self._make_entry(
+                staging_root, name=f"tmp{i:04d}",
+                age_seconds=runner._STALE_STAGING_MAX_AGE_SECONDS + 60,
+            )
+            for i in range(total)
+        ]
+        runner.reap_stale_staging_dirs()
+        remaining = [e for e in entries if e.exists()]
+        assert len(remaining) == 5
+
+    def test_never_raises_when_staging_root_does_not_exist(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(policy, "CREDENTIAL_STAGING_ROOT", str(tmp_path / "nowhere"))
+        runner.reap_stale_staging_dirs()  # must not raise
+
+    def test_reap_runs_automatically_before_staging_a_new_credentials_copy(
+        self, monkeypatch, repo, staging_root, tmp_path,
+    ):
+        stale = self._make_entry(
+            staging_root, age_seconds=runner._STALE_STAGING_MAX_AGE_SECONDS + 60,
+        )
+        runner.reset_preflight_cache()
+        monkeypatch.setattr(
+            runner, "docker_preflight",
+            lambda *a, **k: {"ok": True, "reason": "", "docker_present": True,
+                             "daemon_ok": True, "image_present": True},
+        )
+        creds = tmp_path / "creds.json"
+        creds.write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(policy, "HOST_CREDENTIALS_PATH", str(creds))
+
+        class _Completed:
+            returncode = 0
+            stdout = json.dumps({"result": "done"})
+            stderr = ""
+
+        monkeypatch.setattr(runner, "_run_subprocess", lambda *a, **k: _Completed())
+        try:
+            runner.spawn_claude(task="t", cwd=str(repo), model="claude-sonnet-5", timeout_seconds=5)
+        finally:
+            runner.reset_preflight_cache()
+
+        assert not stale.exists()
+
+
 class TestSpawnUnexpectedException:
     @pytest.fixture(autouse=True)
     def _preflight_ok(self, monkeypatch):
@@ -866,6 +1293,27 @@ class TestSpawnUnexpectedException:
         monkeypatch.setattr(runner, "_run_subprocess", _boom)
         with pytest.raises(OSError):
             runner.spawn_claude(task="t", cwd=str(repo), model="claude-sonnet-5", timeout_seconds=5)
+
+    def test_container_cleanup_still_runs_on_a_non_timeout_exception(self, monkeypatch, repo):
+        """Even though the exception itself propagates, the exact cidfile
+        container for this spawn must still be force-removed — cleanup on
+        the "exception" terminal path is a ``finally``, not conditioned on
+        which exception was raised."""
+        removed = []
+        monkeypatch.setattr(
+            runner, "_force_remove_container",
+            lambda cidfile, env=None: removed.append(cidfile.read_text().strip()),
+        )
+
+        def _boom(cmd, *a, **k):
+            cidfile = Path(cmd[cmd.index("--cidfile") + 1])
+            cidfile.write_text("f" * 64, encoding="ascii")
+            raise OSError("docker vanished mid-run")
+
+        monkeypatch.setattr(runner, "_run_subprocess", _boom)
+        with pytest.raises(OSError):
+            runner.spawn_claude(task="t", cwd=str(repo), model="claude-sonnet-5", timeout_seconds=5)
+        assert removed == ["f" * 64]
 
 
 class TestVerificationExecution:
@@ -1551,6 +1999,84 @@ class TestCwdPathChainRace:
         )
         assert result["exit_code"] == 0
         assert captured["cwd"] == os.path.realpath(str(repo))
+
+
+class TestMountRootAclProvisioning:
+    """Group-write on the mount root ITSELF (never on parents — those stay
+    protected, asserted above) is only ever safe when a verified named POSIX
+    ACL for the sandbox uid explains it (``acl.evaluate_sandbox_uid_provisioning``).
+    A bare ``chmod g+w``/``chmod 775`` — the exact operator workaround that
+    produced ``isolation_refused`` in production — must still refuse."""
+
+    def test_bare_chmod_g_plus_w_without_any_acl_is_refused(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        os.chmod(repo, 0o775)
+        with pytest.raises(runner.CwdRejected, match="named"):
+            runner._mount_plan(os.path.realpath(str(repo)), [str(repo)])
+
+    def test_world_writable_mount_root_is_refused_even_if_acl_would_pass(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        os.chmod(repo, 0o777)
+        monkeypatch.setattr(
+            runner._acl, "evaluate_sandbox_uid_provisioning",
+            lambda *a, **k: (True, "would-be-verified"),
+        )
+        with pytest.raises(runner.CwdRejected, match="world-writable"):
+            runner._mount_plan(os.path.realpath(str(repo)), [str(repo)])
+
+    def test_group_write_with_verified_named_acl_is_accepted(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        os.chmod(repo, 0o775)
+        calls = []
+
+        def _fake_eval(path, uid):
+            calls.append((path, uid))
+            return True, "verified named ACL"
+
+        monkeypatch.setattr(runner._acl, "evaluate_sandbox_uid_provisioning", _fake_eval)
+        mount_root, _container_cwd, _snapshot = runner._mount_plan(
+            os.path.realpath(str(repo)), [str(repo)],
+        )
+        assert mount_root == os.path.realpath(str(repo))
+        assert calls == [(os.path.realpath(str(repo)), policy.SANDBOX_UID)]
+
+    def test_group_write_with_unverified_acl_is_refused_with_reason(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        os.chmod(repo, 0o775)
+        monkeypatch.setattr(
+            runner._acl, "evaluate_sandbox_uid_provisioning",
+            lambda *a, **k: (False, "no named ACL entry for uid 10001"),
+        )
+        with pytest.raises(runner.CwdRejected, match="no named ACL entry"):
+            runner._mount_plan(os.path.realpath(str(repo)), [str(repo)])
+
+    def test_acl_is_never_consulted_when_the_mode_has_no_group_write_bit(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        os.chmod(repo, 0o755)
+        calls = []
+        monkeypatch.setattr(
+            runner._acl, "evaluate_sandbox_uid_provisioning",
+            lambda *a, **k: calls.append(1) or (True, "x"),
+        )
+        runner._mount_plan(os.path.realpath(str(repo)), [str(repo)])
+        assert calls == []
+
+    def test_the_real_acl_module_reproduces_the_production_gap_end_to_end(self, tmp_path):
+        """No mocking of ``acl`` at all: on a filesystem with no ACL support
+        (typical for a tmp test dir), a bare ``chmod 775`` carries no ACL
+        xattr, so the real ``acl.evaluate_sandbox_uid_provisioning`` reports
+        it unsafe and the mount root is refused — reproducing exactly the
+        ``isolation_refused`` incident from a chmod-based workaround."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        os.chmod(repo, 0o775)
+        with pytest.raises(runner.CwdRejected):
+            runner._mount_plan(os.path.realpath(str(repo)), [str(repo)])
 
 
 class TestCredentialStaging:

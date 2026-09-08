@@ -1,22 +1,37 @@
-"""Auto model routing for the claude_worker tool (requirement 2).
+"""Model routing for the claude_worker tool (requirement 2).
 
-Sonnet is the default. Opus is used for a classifier hit on architecture /
-security / hard-debugging tasks, or for exactly one controlled escalation
-after a Sonnet attempt fails for a non-breaker reason.
+Sonnet is the default for every task, unconditionally. Opus is used ONLY
+when the caller supplies BOTH an allowed ``complexity`` classification
+(architecture / security / hard-debugging) AND explicit authorization
+(``allow_opus=True``) — either one alone selects Sonnet. There is exactly
+one spawn per ``claude_worker`` call: no retry, no post-failure escalation,
+and the task text itself never influences model selection.
 
-Nothing here is configurable. Terra's review found the contract mutable in
-two directions at once: ``models.default``/``models.escalated`` could be
-swapped, and ``routing.escalate_after_failures`` fed straight into the
-runner's spawn loop, so a value of 2 bought a third spawn. The model
-identities are now literals from ``policy.py`` and the cap is structural —
-``choose_model`` raises for any attempt other than 0 or 1, and refuses
-attempt 1 unless it follows a genuine non-breaker failure of a Sonnet run.
-A task that starts on Opus (a category hit) has nothing to escalate to, so
-it gets no second attempt either.
+This replaces an earlier design that classified free-form task text with a
+keyword scan and allowed one automatic escalation to Opus after a Sonnet
+failure. Both were removed deliberately:
 
-Deliberately NOT an LLM call: classification is a small deterministic
-keyword scan (plus an explicit ``complexity`` override), so routing stays
-fast, testable, and side-effect free.
+* a keyword scan over task text is a covert, caller-invisible way to select
+  a more expensive/more capable model — the caller must ask for Opus
+  explicitly, in a dedicated field, not by phrasing a task a certain way;
+* ``complexity`` alone used to be sufficient to route to Opus. That let any
+  caller who could set one string field opt itself into Opus with no
+  additional authorization. ``allow_opus`` closes that: selecting Opus now
+  requires the caller to affirmatively ask for it, not merely describe the
+  task as hard;
+* a failure-driven second spawn on a bigger model hides cost and latency
+  behind a single tool call and makes "no third spawn" harder to reason
+  about. There is now no failure path that spawns again at all — a caller
+  who wants to retry calls ``claude_worker`` again themselves.
+
+Nothing here is configurable. The model identities are literals from
+``policy.py``; there is no ``models.default``/``models.escalated`` config
+key and no ``routing.escalate_after_failures`` — the whole point of this
+module is that neither the model chosen nor the number of spawns can be
+changed by configuration or by task phrasing.
+
+Deliberately NOT an LLM call: this is a small, pure, side-effect-free
+function, so routing stays fast and testable.
 """
 
 from __future__ import annotations
@@ -27,22 +42,9 @@ from . import policy as _policy
 
 MODEL_ALLOWLIST = _policy.MODEL_ALLOWLIST
 
-_BREAKER_FAILURE_CLASSES = frozenset({"auth", "rate", "extra_usage"})
-
+#: The only ``complexity`` values that are even eligible for Opus — still
+#: insufficient on their own; ``allow_opus=True`` is also required.
 _COMPLEXITY_CATEGORIES = frozenset({"architecture", "security", "hard_debugging"})
-
-_ARCHITECTURE_KEYWORDS = (
-    "architecture", "system design", "design review", "refactor plan",
-    "design doc", "high-level design",
-)
-_SECURITY_KEYWORDS = (
-    "security", "vulnerability", "vuln", "cve", "exploit", "auth bypass",
-    "injection", "privilege escalation", "penetration test", "pentest",
-)
-_HARD_DEBUGGING_KEYWORDS = (
-    "segfault", "race condition", "heisenbug", "flaky", "deadlock",
-    "memory corruption", "data corruption", "intermittent",
-)
 
 
 class ModelNotAllowedError(ValueError):
@@ -59,70 +61,35 @@ def validate_model(model: str) -> str:
     return model
 
 
-def _classify_complexity(task: str, complexity: Optional[str]) -> Optional[str]:
-    if complexity:
-        normalized = complexity.strip().lower()
-        if normalized in _COMPLEXITY_CATEGORIES:
-            return normalized
-    lower_task = (task or "").lower()
-    for keyword in _SECURITY_KEYWORDS:
-        if keyword in lower_task:
-            return "security"
-    for keyword in _ARCHITECTURE_KEYWORDS:
-        if keyword in lower_task:
-            return "architecture"
-    for keyword in _HARD_DEBUGGING_KEYWORDS:
-        if keyword in lower_task:
-            return "hard_debugging"
-    return None
+def _normalized_category(complexity: Optional[str]) -> Optional[str]:
+    if not isinstance(complexity, str):
+        return None
+    normalized = complexity.strip().lower()
+    return normalized if normalized in _COMPLEXITY_CATEGORIES else None
 
 
 def choose_model(
     task: str,
-    attempt: int = 0,
     complexity: Optional[str] = None,
-    previous_failure_class: Optional[str] = None,
+    allow_opus: bool = False,
 ) -> Tuple[str, str]:
-    """Return ``(model, route_reason)`` for a claude_worker spawn attempt.
+    """Return ``(model, route_reason)`` for the one claude_worker spawn.
 
-    ``attempt`` is 0 for the first spawn and 1 for the single permitted
-    escalation. Every other case raises ``RuntimeError`` — the hard "no
-    third spawn" guarantee, enforced here rather than trusted to the caller:
+    *task* is accepted (and otherwise ignored) only so callers do not need to
+    special-case this signature — it is never inspected. Opus requires BOTH:
 
-    * ``attempt`` outside ``range(policy.MAX_ATTEMPTS)``;
-    * ``attempt == 1`` with no previous failure, or with a breaker-class
-      failure (auth/rate/extra_usage — a bigger model is never the right
-      answer to a credentials or quota problem);
-    * ``attempt == 1`` for a task that already started on Opus.
+    * ``complexity`` to be one of ``architecture``/``security``/
+      ``hard_debugging`` (case-insensitive, whitespace-trimmed); and
+    * ``allow_opus`` to be the literal ``True`` — anything else (missing,
+      ``False``, a truthy-looking non-bool) leaves the model on Sonnet.
+
+    Every other combination — no complexity, an unrecognized complexity,
+    ``allow_opus`` not True, or both together — returns
+    ``policy.DEFAULT_MODEL`` with route reason ``"default"``.
     """
-    if not isinstance(attempt, int) or isinstance(attempt, bool):
-        raise RuntimeError(f"claude_worker: invalid attempt {attempt!r}")
-    if attempt < 0 or attempt >= _policy.MAX_ATTEMPTS:
-        raise RuntimeError(
-            f"claude_worker: attempt {attempt} is outside the structural cap "
-            f"of {_policy.MAX_ATTEMPTS} attempts — no further spawn permitted"
-        )
+    del task  # never inspected; kept for call-site symmetry only
 
-    category = _classify_complexity(task, complexity)
-
-    if attempt == 0:
-        if category is not None:
-            return validate_model(_policy.ESCALATION_MODEL), f"category:{category}"
-        return validate_model(_policy.DEFAULT_MODEL), "default"
-
-    # attempt == 1: the one escalation, and only from a real Sonnet failure.
-    if category is not None:
-        raise RuntimeError(
-            f"claude_worker: task already routed to {_policy.ESCALATION_MODEL} "
-            f"(category:{category}) — there is nothing to escalate to"
-        )
-    if previous_failure_class is None:
-        raise RuntimeError(
-            "claude_worker: escalation requires a previous failed attempt"
-        )
-    if previous_failure_class in _BREAKER_FAILURE_CLASSES:
-        raise RuntimeError(
-            f"claude_worker: {previous_failure_class} failures never escalate — "
-            "the breaker, not a bigger model, is the response to auth/rate/quota errors"
-        )
-    return validate_model(_policy.ESCALATION_MODEL), "escalation:sonnet-failure"
+    category = _normalized_category(complexity)
+    if category is not None and allow_opus is True:
+        return validate_model(_policy.ESCALATION_MODEL), f"authorized:{category}"
+    return validate_model(_policy.DEFAULT_MODEL), "default"

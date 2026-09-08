@@ -18,9 +18,12 @@ Wires together the modules in this package:
                       real (non-bare) Git worktree, symlink escapes, and
                       system-sensitive or multi-project roots. The resolved
                       root is the only directory ever bind-mounted.
-* ``routing.py``   — Sonnet-default auto routing; Opus for architecture /
-                      security / hard-debugging, or exactly one controlled
-                      escalation after a Sonnet non-breaker failure.
+* ``routing.py``   — Sonnet by default, unconditionally, for every call.
+                      Opus requires BOTH an allowed ``complexity``
+                      classification (architecture/security/hard_debugging)
+                      AND explicit ``allow_opus=True`` authorization — either
+                      alone stays on Sonnet. Exactly one spawn per call; no
+                      failure-driven retry or escalation.
 * ``breaker.py``    — a per-failure-class (auth/rate/extra_usage) circuit
                        breaker with cooldown; open means no spawn, no retry.
 * ``trust.py``      — root-owned/non-symlink/non-world-writable path-chain
@@ -97,16 +100,36 @@ TOOL_SCHEMA: Dict[str, Any] = {
     "description": (
         "Delegate a coding task to an isolated Claude Code CLI subprocess, "
         "authenticated via the installed Claude Code OAuth session (never "
-        "an API key). Auto-routes between claude-sonnet-5 (default) and "
-        "claude-opus-5 (architecture/security/hard-debugging tasks, or one "
-        "controlled escalation after a Sonnet failure). Runs isolated: an "
-        "empty, strict MCP config, a scoped tool allowlist, and a cwd "
-        "pinned to the canonical Git worktree root resolved from the "
-        "requested cwd — that one repository is the only directory mounted "
-        "into the sandbox. If the host OAuth credential is missing or "
-        "expired the call HOLDs before spawning anything "
-        "(failure_class auth_preflight) and the host session must be "
-        "re-authenticated. Use this instead of direct file edits: in a "
+        "an API key). Exactly one spawn per call — claude-sonnet-5 by "
+        "default, always. Task text/keywords never choose the model, and a "
+        "failed attempt is never automatically retried on a bigger model. "
+        "claude-opus-5 is used ONLY when the caller supplies BOTH an "
+        "allowed `complexity` classification (architecture/security/"
+        "hard_debugging) AND `allow_opus: true` in the same call — either "
+        "one alone leaves the model on Sonnet, so `complexity` by itself "
+        "never authorizes Opus. Runs isolated: an empty, strict MCP "
+        "config, a scoped tool allowlist (Bash is denied — the worker can "
+        "never run a test suite itself), and a cwd pinned to the "
+        "canonical Git worktree root resolved from the requested cwd — "
+        "that one repository is the only directory mounted into the "
+        "sandbox. If the host OAuth credential is missing or expired the "
+        "call HOLDs before spawning anything (failure_class "
+        "auth_preflight) and the host session must be re-authenticated. "
+        "Because Bash is unavailable inside the worker, a successful "
+        "result (`success: true`) is self-reported evidence — Claude's own "
+        "summary text and the observed `files_touched` — never proof a "
+        "test suite passed: the result's `validation_status` is "
+        "`unverified` and `parent_verification_required` is true unless an "
+        "operator-configured verifier command actually ran in its own "
+        "isolated container and exited 0, in which case `validation_status` "
+        "is `verified_by_configured_verifier`. Default to running your own "
+        "targeted tests after any call whose `validation_status` is not "
+        "`verified_by_configured_verifier`. For a task likely to run past "
+        "900 seconds, split it into coherent, independently testable "
+        "slices — one `claude_worker` call per slice — and run targeted "
+        "tests between slices yourself rather than expecting one call to "
+        "cover everything; never retry a slice on a bigger model after a "
+        "failure. Use this instead of direct file edits: in a "
         "Discord-origin session (any channel, DM, or thread) direct "
         "patch/write_file/skill_manage edits inside a Git repository are "
         "blocked for the whole session and every code change goes through "
@@ -135,8 +158,29 @@ TOOL_SCHEMA: Dict[str, Any] = {
                 "type": "string",
                 "enum": ["architecture", "security", "hard_debugging"],
                 "description": (
-                    "Optional explicit complexity hint that forces "
-                    "claude-opus-5 routing regardless of keyword detection."
+                    "Optional classification of why this task might warrant "
+                    "claude-opus-5. On its own this authorizes NOTHING and "
+                    "the model stays claude-sonnet-5 — it must be combined "
+                    "with `allow_opus: true` in the same call before Opus "
+                    "is ever selected. There is no keyword detection over "
+                    "the task text; only this field and `allow_opus` "
+                    "together can move routing off Sonnet."
+                ),
+            },
+            "allow_opus": {
+                "type": "boolean",
+                "description": (
+                    "Explicit user/caller authorization to spend claude-"
+                    "opus-5 on this call. Default false: omitting this "
+                    "field (existing callers) keeps every call on "
+                    "claude-sonnet-5. Must be the literal boolean `true` — "
+                    "any other value (a string, a number, `false`, or "
+                    "omission) leaves the model on Sonnet — and even then "
+                    "Opus is selected only if `complexity` is also one of "
+                    "the enum values above; neither field alone is "
+                    "sufficient. There is no automatic escalation to Opus "
+                    "after a Sonnet failure — set this explicitly on a new "
+                    "call if you want to retry a task on Opus yourself."
                 ),
             },
             "allow_terra_fallback": {

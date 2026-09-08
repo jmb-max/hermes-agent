@@ -270,11 +270,111 @@ by type plus redacted text rather than as a traceback).
 
 ## Models and routing
 
-`claude-sonnet-5` is the default for every task. `claude-opus-5` is used for an
-architecture / security / hard-debugging classification, or for the single
-controlled escalation after one non-breaker Sonnet failure. Both are policy
-literals, unreachable from configuration, and the attempt cap is structurally
-2. Hermes' own Sol/Terra/Grok routing is a separate system and is untouched.
+`claude-sonnet-5` is the default for every task, unconditionally — this is
+the ONLY model any existing caller gets, including one that supplies
+`complexity` and nothing else. There is exactly **one** spawn per
+`claude_worker` call (`policy.MAX_ATTEMPTS == 1`): no retry, no
+failure-driven escalation to a bigger model. A caller who wants to try a
+task again — on the same model or on Opus — calls `claude_worker` again
+themselves; the tool never does it for them.
+
+`claude-opus-5` is used only when a call supplies **both**:
+
+* `complexity` — one of `architecture` / `security` / `hard_debugging`
+  (case-insensitive, whitespace-trimmed); and
+* `allow_opus: true` — the literal boolean `true`. Anything else (omitted,
+  `false`, or a truthy-looking non-bool like `"true"`, `1`, or `[True]`)
+  leaves the model on Sonnet.
+
+Either one alone is insufficient. In particular, `complexity` by itself used
+to be enough to route to Opus — any caller who could set one string field
+could opt itself into the more expensive model with no further
+authorization. `allow_opus` closes that: Opus now requires an affirmative,
+separate ask, not merely a task described as hard. Task text/keywords are
+never inspected for routing purposes at all — `routing.choose_model` takes a
+`task` argument only for call-site symmetry and never reads it.
+
+Both model identities and the attempt cap are policy literals in
+`routing.py`/`policy.py`, unreachable from configuration — there is no
+`models.default`/`models.escalated` config key and no
+`routing.escalate_after_failures`. Hermes' own Sol/Terra/Grok routing is a
+separate system and is untouched; this plugin never registers a model
+provider and never writes `model.default`.
+
+## Validation status — Bash is unavailable inside the worker
+
+The sandboxed Claude CLI runs with Bash explicitly denied (see
+`policy.CLAUDE_DENIED_TOOLS`), so it can never run a test suite, linter, or
+type checker itself. A `claude_worker` result's `success: true` therefore
+proves only that the isolated process exited cleanly — never that the code
+it touched is correct. The worker's own `summary` text and the observed
+`files_touched` are self-report/evidence, not test verification: nothing in
+that text (e.g. a claim like "all tests pass" in Claude's own output) is
+ever parsed to decide whether a result is validated.
+
+Every result carries two bounded fields:
+
+* `validation_status` — one of:
+  * `unverified` — the default. No trusted verifier ran: either the spawn
+    itself did not succeed, or `verification.enabled`/`verification.command`
+    is not configured. This is the closed-by-default state; any early exit
+    (breaker open, OAuth HOLD, invalid args, an unexpected internal error)
+    also reports `unverified`.
+  * `verified_by_configured_verifier` — an operator-configured
+    `verification.command` (see Configuration below) actually ran, in its
+    own network-isolated, credential-less sandbox container, and exited 0.
+    Represented distinctly from `unverified` so a caller can tell "a real
+    command ran and passed" apart from "nothing checked this" — both would
+    otherwise collapse into the same `success: true`.
+  * `verification_failed` — the configured verifier ran but did not exit 0
+    (or timed out, or the sandbox itself refused it). Evidence of a
+    problem, not proof of one — still requires parent verification.
+* `parent_verification_required` — `true` unless `validation_status` is
+  `verified_by_configured_verifier`. The caller (Hermes/the parent agent,
+  which does have Bash) should run its own targeted tests whenever this is
+  `true` rather than trusting the worker's self-report alone.
+
+The `verification` field, when a verifier ran, carries its own bounded
+`exit_code`/`stdout`/`stderr`/`duration_ms` (truncated the same way every
+other captured output in this plugin is); it is `null` when no verifier ran.
+The verifier runs with the same `isolation.timeout_seconds` budget as the
+worker spawn itself — there is no separate `verification.timeout_seconds`
+knob.
+
+## Splitting a task likely to exceed 900 seconds
+
+`isolation.timeout_seconds` is clamped to `[30, 3600]` (default 900), and
+there is no retry or escalation on a timeout — a task that runs past its
+budget simply fails with `failure_class: "timeout"`. For a task likely to
+take longer than that, split it into multiple `claude_worker` calls rather
+than hoping one call finishes in time:
+
+* Each call should cover **one coherent, independently testable slice** of
+  the overall task — a slice small enough to both finish inside the timeout
+  and be checked on its own, not an arbitrary line-count chunk.
+* Between slices, the parent runs its **own targeted tests** against the
+  slice just completed (it has Bash; the worker does not — see Validation
+  status above). Do not chain slices blind on the worker's self-reported
+  `summary` alone.
+* Never retry a failed slice automatically, and never escalate a failed
+  slice to `claude-opus-5` automatically — both are structurally absent
+  from this plugin (see Models and routing above). If a slice needs a retry
+  or a different model, that is a **new, explicit** `claude_worker` call
+  the parent decides to make, not something this tool does on its own.
+* Before resuming work on a repository after a slice — especially after a
+  timeout, an interrupted session, or picking the work back up later —
+  inspect `git status`/`git diff` in that repository first, rather than
+  assuming the last slice left it in the expected state. Also check for
+  orphaned sandbox containers/staging directories from an interrupted
+  slice: `runner.py` already force-removes and verifies removal of the
+  container for every spawn it starts (`_force_remove_container`) and
+  opportunistically reaps stale credential-staging directories older than
+  `2 * config.MAX_TIMEOUT_SECONDS` (twice the maximum possible
+  `isolation.timeout_seconds`) on the next spawn (`reap_stale_staging_dirs`),
+  but a slice killed hard enough to skip its
+  own cleanup (e.g. the host process itself was killed) can still leave one
+  behind until that next spawn runs; `docker ps`/`docker rm --force` and a
+  manual look under the credential staging root are the operator fallback.
 
 ## Configuration
 
@@ -302,6 +402,10 @@ plugins:
         enabled: false
         command: []            # fixed operator argv, run in its own
                                # network-isolated, credential-less container
+                               # after a successful spawn; only a passing
+                               # run here moves validation_status to
+                               # verified_by_configured_verifier (see
+                               # "Validation status" above)
 ```
 
 ### Deprecated, still parsed, inert
@@ -329,6 +433,7 @@ pytest tests/plugins/test_claude_worker_canary.py \
        tests/plugins/test_claude_worker_policy.py \
        tests/plugins/test_claude_worker_config.py \
        tests/plugins/test_claude_worker_plugin_registration.py \
+       tests/plugins/test_claude_worker_routing.py \
        tests/plugins/test_claude_worker_runner.py \
        tests/plugins/test_claude_worker_oauth.py \
        tests/plugins/test_claude_worker_isolation.py

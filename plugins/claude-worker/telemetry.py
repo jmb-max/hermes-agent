@@ -64,6 +64,7 @@ SAFE_FIELDS: tuple = (
     "ts", "session_id", "chat_id", "model", "route_reason", "attempt",
     "escalated", "duration_ms", "exit_code", "failure_class",
     "breaker_state", "cwd", "files_touched", "success", "telemetry_error",
+    "diagnostic",
 )
 
 #: Fields safe enough to also carry into a fallback record for
@@ -92,6 +93,11 @@ _SECRET_VALUE_PATTERN = re.compile(
 
 _MAX_FILES = 50
 _MAX_VALUE_CHARS = 256
+
+#: Independent bound on a diagnostic excerpt, applied here regardless of
+#: whatever bound the caller already applied (``runner._MAX_ERROR_EXCERPT_CHARS``)
+#: — defense in depth must not trust the caller to have bounded it correctly.
+_MAX_DIAGNOSTIC_EXCERPT_CHARS = 256
 
 # ---------------------------------------------------------------------------
 # Fixed destinations — never derived from caller/config input
@@ -181,6 +187,23 @@ def _write_trusted_line(path: Path, line: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def redact_secret_shapes(text: Any) -> str:
+    """Replace every secret-SHAPED substring in *text* with ``[REDACTED]``,
+    wherever it appears — not an all-or-nothing drop like ``_safe_scalar``'s
+    field scan, a targeted substitution so a bounded diagnostic excerpt stays
+    readable around the part that had to be redacted.
+
+    Shared by ``runner.py``'s bounded failure-diagnostic builder (so an
+    excerpt is redacted before it is ever handed to telemetry) and by this
+    module's own defense-in-depth re-scan of a diagnostic object — the same
+    pattern, applied twice, never trusted from only one side.
+    """
+    value = text if isinstance(text, str) else ("" if text is None else str(text))
+    if not value:
+        return value
+    return _SECRET_VALUE_PATTERN.sub("[REDACTED]", value)
+
+
 def hash_value(value: Any) -> str:
     """Stable, unsalted fingerprint — correlatable, not reversible to a name."""
     try:
@@ -264,8 +287,14 @@ def build_record(
     cwd: str = "",
     files_touched: Optional[List[str]] = None,
     success: bool = False,
+    diagnostic: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Build a telemetry record from named, already-safe fields."""
+    """Build a telemetry record from named, already-safe fields.
+
+    ``diagnostic`` is ``None`` on every success, preflight-HOLD, and
+    breaker-open-refusal path — it is only ever populated by a caller that
+    actually ran a failing spawn, never fabricated here.
+    """
     return {
         "ts": ts,
         "session_id": session_id,
@@ -281,6 +310,38 @@ def build_record(
         "cwd": cwd,
         "files_touched": list(files_touched or []),
         "success": success,
+        "diagnostic": diagnostic,
+    }
+
+
+def _safe_diagnostic(value: Any) -> Optional[Dict[str, Any]]:
+    """Sanitize a bounded failure-diagnostic object down to its exact,
+    already-small, already-redacted surface.
+
+    Independent defense in depth, not trust in the caller: the excerpt is
+    re-redacted for secret shapes and re-truncated to this module's own
+    (possibly tighter) bound, and every field is re-typed rather than
+    passed through. ``None`` (no diagnostic — success, preflight, or
+    refusal) and anything not shaped like a diagnostic both sanitize to
+    ``None``, never a fabricated placeholder.
+    """
+    if not isinstance(value, dict):
+        return None
+    source = value.get("error_source")
+    excerpt = value.get("error_excerpt")
+    fingerprint = value.get("error_fingerprint")
+    status = value.get("api_error_status")
+
+    excerpt_text = excerpt if isinstance(excerpt, str) else ""
+    excerpt_text = redact_secret_shapes(excerpt_text)[:_MAX_DIAGNOSTIC_EXCERPT_CHARS]
+
+    return {
+        "error_source": source[:64] if isinstance(source, str) else "",
+        "error_excerpt": excerpt_text,
+        "error_fingerprint": fingerprint if isinstance(fingerprint, str) else "",
+        "api_error_status": (
+            status if isinstance(status, int) and not isinstance(status, bool) else None
+        ),
     }
 
 
@@ -295,6 +356,8 @@ def _sanitize(record: Dict[str, Any]) -> Dict[str, Any]:
             safe[key] = hash_path(value)
         elif key == "files_touched":
             safe[key] = _safe_files(value, raw_cwd)
+        elif key == "diagnostic":
+            safe[key] = _safe_diagnostic(value)
         else:
             safe[key] = _safe_scalar(key, value)
     return safe
