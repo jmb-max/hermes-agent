@@ -25,9 +25,11 @@ logger = logging.getLogger("tools.code_execution_tool")
 _TERMINAL_BLOCKED_PARAMS = {"background", "pty", "notify", "notify_on_complete", "watch_patterns", "heartbeat", "persist_on_release"}
 
 
-def _default_dispatch(task_id):
+def _default_dispatch(task_id, gateway_session_key=""):
     from model_tools import handle_function_call
-    return lambda tool_name, tool_args: handle_function_call(tool_name, tool_args, task_id=task_id)
+    gateway_session_key = gateway_session_key or ""
+    return lambda tool_name, tool_args: handle_function_call(
+        tool_name, tool_args, task_id=task_id, gateway_session_key=gateway_session_key)
 
 
 def _private_dirs_cmd(root: str, *subdirs: str) -> str:
@@ -115,14 +117,15 @@ def _handle_rpc_request(request: dict, *, allowed_tools: frozenset, tool_call_co
 
 def _rpc_server_loop(server_sock: socket.socket, task_id: str, tool_call_log: list,
                      tool_call_counter: list, max_tool_calls: int, allowed_tools: frozenset,
-                     stop_event: threading.Event, rpc_token: str, dispatch=None):
+                     stop_event: threading.Event, rpc_token: str, dispatch=None,
+                     gateway_session_key: str = ""):
     """Accept one client and serve newline-delimited JSON requests until it disconnects, idles
     300s, or the call limit is reached. ``tool_call_counter`` is a mutable ``[int]``. ``dispatch``
     overrides how an allowed, budgeted call runs: per-call sandboxes use the default (the thread
     carries the cell's context); session kernels rebind each call to the CURRENT cell's authority.
     """
     if dispatch is None:
-        dispatch = _default_dispatch(task_id)
+        dispatch = _default_dispatch(task_id, gateway_session_key=gateway_session_key or "")
     conn = None
     try:
         server_sock.settimeout(0.05)
@@ -175,11 +178,11 @@ def _rpc_server_loop(server_sock: socket.socket, task_id: str, tool_call_log: li
 
 def _rpc_poll_loop(env, rpc_dir: str, task_id: str, tool_call_log: list, tool_call_counter: list,
                    max_tool_calls: int, allowed_tools: frozenset, stop_event: threading.Event,
-                   rpc_token: str):
+                   rpc_token: str, gateway_session_key: str = ""):
     """Poll the remote filesystem for request files and answer them. Background thread; each
     ``env.execute()`` is an independent process, so this is safe alongside the script-execution
     thread. Malformed or unauthorized requests are removed without a response."""
-    dispatch = _default_dispatch(task_id)
+    dispatch = _default_dispatch(task_id, gateway_session_key=gateway_session_key or "")
     poll_interval = 0.1
     quoted_rpc_dir = shlex.quote(rpc_dir)
     while not stop_event.is_set():
