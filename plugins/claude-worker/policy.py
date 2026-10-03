@@ -90,12 +90,12 @@ SKILL_MANAGE_MUTATING_ACTIONS = frozenset({
 # Models and the structural attempt cap
 #
 # These two literals ARE the canonical claude_worker runtime — the model pair
-# the sandbox image, the routing rules, and the escalation cap were all proven
-# against. ``claude-sonnet-5`` is the default for every task;
-# ``claude-opus-5`` is used for an architecture / security / hard-debugging
-# classification, or for the single controlled escalation after one non-
-# breaker Sonnet failure. Nothing in this hardening pass changes either id,
-# and neither is reachable from configuration. (Hermes' own Sol/Terra/Grok
+# the sandbox image and the routing rules were all proven against.
+# ``claude-sonnet-5`` is the default for every task; ``claude-opus-5`` is
+# used ONLY when the caller passes an explicit ``complexity`` that exactly
+# matches one of the tool schema's allowed values (architecture / security /
+# hard-debugging). Nothing in this hardening pass changes either id, and
+# neither is reachable from configuration. (Hermes' own Sol/Terra/Grok
 # routing is a separate system and is untouched by this plugin.)
 # ---------------------------------------------------------------------------
 
@@ -105,13 +105,17 @@ ESCALATION_MODEL = "claude-opus-5"
 #: Defense in depth only — the identities above are the contract.
 MODEL_ALLOWLIST = frozenset({"claude-sonnet-5", "claude-opus-5"})
 
-#: Attempt 0 (Sonnet) plus at most one escalation (Opus). Never configurable.
-MAX_ATTEMPTS = 2
+#: Exactly one spawn per ``claude_worker`` call, ever. There is no
+#: failure-driven escalation and therefore no second attempt to cap: a
+#: Sonnet (or Opus, via explicit ``complexity``) failure of ANY class —
+#: timeout, nonzero exit, isolation refusal, auth/preflight, quota, or
+#: anything else — is returned as-is. Never configurable.
+MAX_ATTEMPTS = 1
 
-#: Hard wall-clock budget shared by every model attempt in one tool call.
-#: It stays five minutes below the production gateway's 1,800-second timeout,
-#: leaving headroom for evidence collection, telemetry, and the tool response.
-#: Configuration may shorten individual attempts but can never widen this total.
+#: Hard wall-clock budget for the one model attempt in a tool call. It stays
+#: five minutes below the production gateway's 1,800-second timeout, leaving
+#: headroom for evidence collection, telemetry, and the tool response.
+#: Configuration may shorten the attempt but can never widen this total.
 MAX_TOTAL_ATTEMPT_SECONDS = 1500
 
 
@@ -144,7 +148,7 @@ SANDBOX_IMAGE_TAG = f"claude-worker-sandbox:{CLAUDE_CLI_VERSION}"
 #: id, and only then is the id considered trustworthy to run. This value is
 #: generated from the locally built, Node-22-based sandbox image during
 #: activation and is deliberately a policy literal rather than config.
-SANDBOX_IMAGE_ID = "sha256:46dc23aaa53c845dacb081dbd71d865a1772fdb2af51fb28ee8f4bfa35f8dc80"
+SANDBOX_IMAGE_ID = "sha256:5e5a8ac6f202a552b6b5bf01dc9b666fdef2218826043123c2140585c0645e26"
 SANDBOX_IMAGE_ID_CONFIGURED = True
 
 #: The worker edits files. It does not run commands, fetch URLs, or spawn

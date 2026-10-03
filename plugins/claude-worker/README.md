@@ -270,11 +270,17 @@ by type plus redacted text rather than as a traceback).
 
 ## Models and routing
 
-`claude-sonnet-5` is the default for every task. `claude-opus-5` is used for an
-architecture / security / hard-debugging classification, or for the single
-controlled escalation after one non-breaker Sonnet failure. Both are policy
-literals, unreachable from configuration, and the attempt cap is structurally
-2. Hermes' own Sol/Terra/Grok routing is a separate system and is untouched.
+`claude-sonnet-5` is always the default. `claude-opus-5` is used ONLY when the
+caller passes an explicit `complexity` value that exactly matches one of the
+tool schema's allowed values (`architecture` / `security` / `hard_debugging`).
+The text of `task` never influences routing — there is no keyword or
+heuristic scan of any kind. Both model identities are policy literals,
+unreachable from configuration, and there is no failure-driven escalation or
+retry: `claude_worker` makes exactly one spawn attempt per call
+(`policy.MAX_ATTEMPTS == 1`), and a failure of any class — timeout, nonzero
+exit, isolation refusal, auth/preflight, quota, or anything else — is
+returned as-is. Hermes' own Sol/Terra/Grok routing is a separate system and is
+untouched.
 
 ## Configuration
 

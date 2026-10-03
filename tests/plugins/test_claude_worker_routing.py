@@ -1,10 +1,15 @@
 """Tests for ``plugins/claude-worker/routing.py``.
 
 Routing is a closed, non-configurable contract: literal ``claude-sonnet-5``
-by default, literal ``claude-opus-5`` for architecture/security/hard-debugging
-or for the single escalation after one non-breaker Sonnet failure. The
-attempt cap is structural (``policy.MAX_ATTEMPTS == 2``) and there is no
-config-supplied model or cap parameter to swap.
+is ALWAYS the selection when the caller omits ``complexity``, and literal
+``claude-opus-5`` is selected ONLY when the caller passes an explicit,
+non-null ``complexity`` that exactly matches one of the values the tool
+schema already declares (``architecture`` / ``security`` /
+``hard_debugging``). The text of ``task`` never influences routing — there
+is no keyword/heuristic scan of any kind — and there is no failure-driven
+escalation: ``choose_model`` takes no ``attempt`` or ``previous_failure_class``
+input at all, because a Sonnet failure of any class is never retried on a
+different model.
 """
 
 from __future__ import annotations
@@ -40,107 +45,92 @@ class TestNoConfigurableModelsOrCap:
         assert "escalated_model" not in params
         assert "escalate_after_failures" not in params
 
+    def test_choose_model_has_no_escalation_surface(self):
+        """There is no escalation of any kind left to parameterize: no
+        ``attempt`` counter and no ``previous_failure_class`` input — a
+        failure is never a reason to pick a different model."""
+        params = set(inspect.signature(routing.choose_model).parameters)
+        assert "attempt" not in params
+        assert "previous_failure_class" not in params
+
+    def test_attempt_kwarg_is_rejected(self):
+        with pytest.raises(TypeError):
+            routing.choose_model(task="fix a typo", attempt=1)
+
+    def test_previous_failure_class_kwarg_is_rejected(self):
+        with pytest.raises(TypeError):
+            routing.choose_model(task="fix a typo", previous_failure_class="other")
+
     def test_module_never_loads_plugin_config(self):
         source = open(routing.__file__, encoding="utf-8").read()
         assert "load_plugin_config" not in source
 
+    def test_module_has_no_keyword_heuristic_scan(self):
+        """The whole keyword/heuristic classifier is gone, not merely
+        unreachable — asserted at the source level so a reintroduced keyword
+        list fails this test even if no behavioral test happens to trip it."""
+        source = open(routing.__file__, encoding="utf-8").read()
+        for token in (
+            "KEYWORDS", "lower_task", "_classify_complexity",
+            "segfault", "vulnerability", "system design",
+        ):
+            assert token not in source
+
 
 class TestDefaultRouting:
     def test_default_is_sonnet(self):
-        model, reason = routing.choose_model(task="fix a typo in the README", attempt=0)
+        model, reason = routing.choose_model(task="fix a typo in the README")
         assert model == policy.DEFAULT_MODEL == "claude-sonnet-5"
-        assert "default" in reason
+        assert reason == "default"
 
     def test_plain_bugfix_task_stays_sonnet(self):
-        model, _reason = routing.choose_model(task="the button click handler is off by one", attempt=0)
+        model, _reason = routing.choose_model(task="the button click handler is off by one")
         assert model == "claude-sonnet-5"
 
-
-class TestComplexityClassification:
     @pytest.mark.parametrize(
         "task",
         [
             "review the overall system architecture for this service",
             "propose a system design for the new ingestion pipeline",
-        ],
-    )
-    def test_architecture_keyword_routes_to_opus(self, task):
-        model, reason = routing.choose_model(task=task, attempt=0)
-        assert model == "claude-opus-5"
-        assert "architecture" in reason
-
-    @pytest.mark.parametrize(
-        "task",
-        [
             "investigate this potential SQL injection vulnerability",
             "assess whether this endpoint has an auth bypass",
-        ],
-    )
-    def test_security_keyword_routes_to_opus(self, task):
-        model, reason = routing.choose_model(task=task, attempt=0)
-        assert model == "claude-opus-5"
-        assert "security" in reason
-
-    @pytest.mark.parametrize(
-        "task",
-        [
             "track down this flaky race condition in the test suite",
             "diagnose an intermittent deadlock under load",
         ],
     )
-    def test_hard_debugging_keyword_routes_to_opus(self, task):
-        model, reason = routing.choose_model(task=task, attempt=0)
-        assert model == "claude-opus-5"
-        assert "hard_debugging" in reason
-
-    def test_explicit_complexity_arg_overrides_keyword_scan(self):
-        model, reason = routing.choose_model(task="fix a typo", attempt=0, complexity="security")
-        assert model == "claude-opus-5"
-        assert "security" in reason
-
-    def test_unknown_complexity_arg_falls_back_to_keyword_scan(self):
-        model, _reason = routing.choose_model(
-            task="fix a typo", attempt=0, complexity="not-a-real-category",
-        )
+    def test_sensitive_vocabulary_without_complexity_stays_sonnet(self, task):
+        """Requirement 3: the CONTENT of ``task`` must never change the
+        model. These read exactly like the retired keyword-triggered
+        categories (architecture/security/hard_debugging) but carry no
+        explicit ``complexity`` — they must route to Sonnet like any other
+        task, with the plain ``"default"`` reason."""
+        model, reason = routing.choose_model(task=task)
         assert model == "claude-sonnet-5"
+        assert reason == "default"
 
 
-class TestEscalation:
-    def test_escalates_to_opus_after_one_sonnet_non_breaker_failure(self):
-        model, reason = routing.choose_model(
-            task="fix a typo", attempt=1, previous_failure_class="other",
+class TestExplicitComplexityIsTheOnlyOpusPath:
+    @pytest.mark.parametrize("complexity", ["architecture", "security", "hard_debugging"])
+    def test_each_schema_allowed_value_routes_to_opus(self, complexity):
+        model, reason = routing.choose_model(task="fix a typo", complexity=complexity)
+        assert model == "claude-opus-5"
+        assert complexity in reason
+
+    def test_explicit_complexity_wins_even_over_a_plain_task(self):
+        model, _reason = routing.choose_model(
+            task="trivial one-line fix", complexity="security",
         )
         assert model == "claude-opus-5"
-        assert "escalat" in reason.lower()
 
-    def test_no_third_spawn_raises(self):
-        with pytest.raises(RuntimeError):
-            routing.choose_model(task="fix a typo", attempt=2, previous_failure_class="other")
-
-    @pytest.mark.parametrize("attempt", [-1, 3, 99])
-    def test_out_of_range_attempts_raise(self, attempt):
-        with pytest.raises(RuntimeError):
-            routing.choose_model(task="fix a typo", attempt=attempt, previous_failure_class="other")
-
-    @pytest.mark.parametrize("failure_class", ["auth", "rate", "extra_usage"])
-    def test_breaker_class_failure_never_escalates(self, failure_class):
-        with pytest.raises(RuntimeError):
-            routing.choose_model(task="fix a typo", attempt=1, previous_failure_class=failure_class)
-
-    def test_escalation_requires_a_previous_failure(self):
-        with pytest.raises(RuntimeError):
-            routing.choose_model(task="fix a typo", attempt=1, previous_failure_class=None)
-
-    def test_initial_opus_task_gets_no_second_attempt(self):
-        """A category task starts on Opus; there is nothing to escalate to,
-        so a second attempt is structurally refused."""
-        first, _reason = routing.choose_model(task="security audit of the auth flow", attempt=0)
-        assert first == "claude-opus-5"
-        with pytest.raises(RuntimeError):
-            routing.choose_model(task="security audit of the auth flow", attempt=1,
-                                 previous_failure_class="other")
-
-    def test_explicit_complexity_also_blocks_a_second_attempt(self):
-        with pytest.raises(RuntimeError):
-            routing.choose_model(task="fix a typo", attempt=1, complexity="architecture",
-                                 previous_failure_class="other")
+    @pytest.mark.parametrize(
+        "bad", ["not-a-real-category", "", "ARCHITECTURE", "Security", None, "  security  "],
+    )
+    def test_non_matching_complexity_falls_back_to_default(self, bad):
+        """Only an EXACT match against the schema's declared enum values
+        selects Opus — no case-folding, no whitespace trimming, and no
+        fallback to any other classification. Anything else (an unknown
+        string, an empty string, wrong case, untrimmed whitespace, or
+        ``None``) is the plain default."""
+        model, reason = routing.choose_model(task="fix a typo", complexity=bad)
+        assert model == "claude-sonnet-5"
+        assert reason == "default"

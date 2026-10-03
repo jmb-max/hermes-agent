@@ -1449,9 +1449,10 @@ def run_worker(
     Orchestrates requirements (1)/(2)/(4)/(6)/(9)/(10) in one call: cwd
     validation, breaker check (no spawn while open) with the explicit Terra
     fallback, an OAuth credential freshness preflight (no spawn on a
-    credential we can already see is stale), auto model routing, an isolated
-    spawn capped structurally at ``policy.MAX_ATTEMPTS``, evidence assembly,
-    exactly one telemetry record, and an advisory Terra review for
+    credential we can already see is stale), auto model routing, exactly one
+    isolated spawn attempt (``policy.MAX_ATTEMPTS == 1`` — no escalation or
+    retry of any kind on any failure class), evidence assembly, exactly one
+    telemetry record, and an advisory Terra review for
     substantial successful changes. Returns a JSON string (the
     ``tools.registry.tool_result`` contract) — deterministic, no raw
     prompts/stdout embedded.
@@ -1776,90 +1777,74 @@ def _breaker_open_payload(
 def _run_attempts(
     task: str, cwd: str, complexity: Optional[str], cfg: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Run at most ``policy.MAX_ATTEMPTS`` spawns and summarize the outcome.
+    """Run exactly ``policy.MAX_ATTEMPTS`` (one) spawn and summarize the
+    outcome.
 
-    The cap is the ``range`` bound AND ``routing.choose_model``'s own
-    structural refusal — two independent enforcements of "no third spawn",
-    neither of which is reachable from configuration.
+    There is no escalation and no retry of any kind: a failure — a nonzero
+    exit, a timeout, a ``SpawnRefused`` isolation refusal, or anything else
+    ``breaker.classify_failure`` names — is returned as-is. Nothing here
+    starts a second ``spawn_claude`` call. A breaker-class failure
+    (auth/rate/extra_usage) still opens that class's cooldown for the NEXT
+    ``claude_worker`` call, but that is a future-call gate, not a retry of
+    this one.
     """
     timeout_seconds = (cfg.get("isolation") or {}).get("timeout_seconds", 900)
+    attempt_timeout_seconds = min(
+        float(timeout_seconds), float(_policy.MAX_TOTAL_ATTEMPT_SECONDS),
+    )
 
-    attempts = 0
-    previous_failure_class: Optional[str] = None
-    model = ""
-    route_reason = ""
-    exit_code: Optional[int] = None
-    duration_ms = 0
-    success = False
-    summary = ""
+    model, route_reason = _routing.choose_model(task=task, complexity=complexity)
 
-    for attempt in range(_policy.MAX_ATTEMPTS):
-        if attempt > 0 and _breaker.is_open():
-            break
-
-        remaining_budget_seconds = max(
-            0.0,
-            _policy.MAX_TOTAL_ATTEMPT_SECONDS - (duration_ms / 1000.0),
+    try:
+        spawn_result = spawn_claude(
+            task=task, cwd=cwd, model=model, timeout_seconds=attempt_timeout_seconds,
         )
-        if remaining_budget_seconds <= 0:
-            break
-        attempt_timeout_seconds = min(
-            float(timeout_seconds), remaining_budget_seconds,
+    except SpawnRefused as exc:
+        logger.warning("claude_worker: spawn refused: %s", exc)
+        return {
+            "success": False,
+            "attempts": 1,
+            "model": model,
+            "route_reason": route_reason,
+            "exit_code": None,
+            "duration_ms": 0,
+            "failure_class": "isolation_refused",
+            "summary": "",
+        }
+
+    exit_code = spawn_result.get("exit_code")
+    duration_ms = int(spawn_result.get("duration_ms") or 0)
+    stdout = spawn_result.get("stdout", "") or ""
+    stderr = spawn_result.get("stderr", "") or ""
+    timed_out = bool(spawn_result.get("timed_out"))
+
+    if not timed_out and exit_code == 0:
+        return {
+            "success": True,
+            "attempts": 1,
+            "model": model,
+            "route_reason": route_reason,
+            "exit_code": exit_code,
+            "duration_ms": duration_ms,
+            "failure_class": None,
+            "summary": _parse_worker_summary(stdout),
+        }
+
+    failure_class = (
+        "timeout" if timed_out else _breaker.classify_failure(exit_code, stderr, stdout)
+    )
+    if failure_class in _breaker.BREAKER_CLASSES:
+        _breaker.record_failure(
+            failure_class, (cfg.get("breaker") or {}).get("cooldown_seconds") or {},
         )
-
-        try:
-            model, route_reason = _routing.choose_model(
-                task=task, attempt=attempt, complexity=complexity,
-                previous_failure_class=previous_failure_class,
-            )
-        except RuntimeError:
-            # Routing refused this attempt (cap reached, breaker-class
-            # failure, or a task that already started on Opus).
-            break
-
-        try:
-            spawn_result = spawn_claude(
-                task=task, cwd=cwd, model=model,
-                timeout_seconds=attempt_timeout_seconds,
-            )
-        except SpawnRefused as exc:
-            attempts += 1
-            previous_failure_class = "isolation_refused"
-            exit_code = None
-            logger.warning("claude_worker: spawn refused: %s", exc)
-            break
-
-        attempts += 1
-        exit_code = spawn_result.get("exit_code")
-        duration_ms += int(spawn_result.get("duration_ms") or 0)
-        stdout = spawn_result.get("stdout", "") or ""
-        stderr = spawn_result.get("stderr", "") or ""
-        timed_out = bool(spawn_result.get("timed_out"))
-
-        if not timed_out and exit_code == 0:
-            summary = _parse_worker_summary(stdout)
-            success = True
-            previous_failure_class = None
-            break
-
-        previous_failure_class = (
-            "timeout" if timed_out else _breaker.classify_failure(exit_code, stderr, stdout)
-        )
-        if previous_failure_class in _breaker.BREAKER_CLASSES:
-            _breaker.record_failure(
-                previous_failure_class,
-                (cfg.get("breaker") or {}).get("cooldown_seconds") or {},
-            )
-            break
-        # "other"/"timeout": fall through to the single escalation attempt.
 
     return {
-        "success": success,
-        "attempts": attempts,
+        "success": False,
+        "attempts": 1,
         "model": model,
         "route_reason": route_reason,
         "exit_code": exit_code,
         "duration_ms": duration_ms,
-        "failure_class": previous_failure_class,
-        "summary": summary,
+        "failure_class": failure_class,
+        "summary": "",
     }

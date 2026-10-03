@@ -1,9 +1,10 @@
 """RED->GREEN tests for ``runner.run_worker`` orchestration and the
 ``_git_changed_files`` helper.
 
-Covers requirements (1)/(4)/(6)/(9): the claude_worker tool handler itself —
-routing + breaker + isolated spawn + evidence + exactly-one-telemetry-record
-per invocation, with the hard "no third spawn" guarantee proven by call
+Covers requirements (1)/(2)/(4)/(6)/(9): the claude_worker tool handler
+itself — routing + breaker + isolated spawn + evidence +
+exactly-one-telemetry-record per invocation, with the hard "exactly one spawn,
+never a second one, regardless of failure class" guarantee proven by call
 counting on a mocked ``spawn_claude``. The container command shape itself
 (mounts, hardening, preflight) is covered by
 ``test_claude_worker_isolation.py``; ``spawn_claude`` is mocked here at the
@@ -369,8 +370,15 @@ class TestRunWorkerBreakerOpen:
         assert "auth" in result["breaker"]["classes"]
 
 
-class TestRunWorkerEscalation:
-    def test_sonnet_failure_escalates_once_to_opus_success(self, tmp_path, monkeypatch):
+class TestRunWorkerNoEscalationOrRetry:
+    """Requirement 4: NO failure of any class ever triggers a second spawn.
+
+    A Sonnet (or explicit-complexity Opus) run that fails — for any reason —
+    is returned as-is. ``spawn_claude`` must be called exactly once per
+    ``run_worker`` invocation, with ``attempts == 1`` and ``escalated ==
+    False``, regardless of which failure class the spawn produced."""
+
+    def test_generic_nonzero_exit_never_spawns_twice(self, tmp_path, monkeypatch):
         repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
 
@@ -378,9 +386,7 @@ class TestRunWorkerEscalation:
 
         def _fake_spawn(**kwargs):
             calls.append(kwargs)
-            if len(calls) == 1:
-                return _spawn_result(exit_code=1, stderr="Traceback: something broke", model=kwargs["model"])
-            return _spawn_result(exit_code=0, stdout=json.dumps({"result": "done", "is_error": False}), model=kwargs["model"])
+            return _spawn_result(exit_code=1, stderr="Traceback: something broke", model=kwargs["model"])
 
         monkeypatch.setattr(runner, "spawn_claude", _fake_spawn)
         monkeypatch.setattr(runner, "_git_changed_files", lambda cwd, repo_roots=None: [])
@@ -388,15 +394,15 @@ class TestRunWorkerEscalation:
         raw = runner.run_worker({"task": "hard bug", "cwd": str(repo)}, session_id="sess:3")
         result = json.loads(raw)
 
-        assert len(calls) == 2
+        assert len(calls) == 1
         assert calls[0]["model"] == "claude-sonnet-5"
-        assert calls[1]["model"] == "claude-opus-5"
-        assert result["success"] is True
-        assert result["escalated"] is True
-        assert result["attempts"] == 2
-        assert result["model"] == "claude-opus-5"
+        assert result["success"] is False
+        assert result["escalated"] is False
+        assert result["attempts"] == 1
+        assert result["model"] == "claude-sonnet-5"
+        assert result["failure_class"] == "other"
 
-    def test_escalation_uses_only_remaining_total_budget(self, tmp_path, monkeypatch):
+    def test_timeout_never_spawns_twice(self, tmp_path, monkeypatch):
         repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(
             config, "_load_raw_config",
@@ -406,14 +412,8 @@ class TestRunWorkerEscalation:
 
         def _fake_spawn(**kwargs):
             calls.append(kwargs)
-            if len(calls) == 1:
-                return _spawn_result(
-                    exit_code=1, timed_out=True, duration_ms=900_000,
-                    model=kwargs["model"],
-                )
             return _spawn_result(
-                exit_code=0, stdout=json.dumps({"result": "done"}),
-                duration_ms=100, model=kwargs["model"],
+                exit_code=1, timed_out=True, duration_ms=900_000, model=kwargs["model"],
             )
 
         monkeypatch.setattr(runner, "spawn_claude", _fake_spawn)
@@ -423,12 +423,17 @@ class TestRunWorkerEscalation:
             {"task": "hard bug", "cwd": str(repo)}, session_id="sess:budget",
         ))
 
-        assert result["success"] is True
-        assert [call["timeout_seconds"] for call in calls] == [
-            900, policy.MAX_TOTAL_ATTEMPT_SECONDS - 900,
-        ]
+        assert len(calls) == 1
+        assert calls[0]["timeout_seconds"] == 900
+        assert result["success"] is False
+        assert result["escalated"] is False
+        assert result["attempts"] == 1
+        assert result["failure_class"] == "timeout"
 
-    def test_no_third_spawn_after_two_failures(self, tmp_path, monkeypatch):
+    def test_empty_response_never_spawns_twice(self, tmp_path, monkeypatch):
+        """A nonzero exit with no stderr markers and no stdout at all
+        classifies as ``other`` — same single-spawn, no-retry behavior as
+        any other generic failure."""
         repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
 
@@ -436,19 +441,44 @@ class TestRunWorkerEscalation:
 
         def _fake_spawn(**kwargs):
             calls.append(kwargs)
-            return _spawn_result(exit_code=1, stderr="Traceback: still broken", model=kwargs["model"])
+            return _spawn_result(exit_code=1, stdout="", stderr="", model=kwargs["model"])
 
         monkeypatch.setattr(runner, "spawn_claude", _fake_spawn)
 
-        raw = runner.run_worker({"task": "hard bug", "cwd": str(repo)}, session_id="sess:4")
+        raw = runner.run_worker({"task": "fix it", "cwd": str(repo)}, session_id="sess:empty")
         result = json.loads(raw)
 
-        assert len(calls) == 2
+        assert len(calls) == 1
         assert result["success"] is False
-        assert result["attempts"] == 2
-        assert result["escalated"] is True
+        assert result["escalated"] is False
+        assert result["attempts"] == 1
+        assert result["failure_class"] == "other"
 
-    def test_auth_failure_opens_breaker_and_does_not_escalate(self, tmp_path, monkeypatch):
+    def test_isolation_refusal_never_spawns_twice(self, tmp_path, monkeypatch):
+        """A ``SpawnRefused`` raised by ``spawn_claude`` itself (the isolation
+        sandbox refusing to run) is also a terminal, single-attempt failure —
+        never retried on a different model."""
+        repo = make_git_repo(tmp_path, "repo")
+        monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
+
+        calls = []
+
+        def _fake_spawn(**kwargs):
+            calls.append(kwargs)
+            raise runner.SpawnRefused("docker sandbox preflight failed")
+
+        monkeypatch.setattr(runner, "spawn_claude", _fake_spawn)
+
+        raw = runner.run_worker({"task": "fix it", "cwd": str(repo)}, session_id="sess:isolation")
+        result = json.loads(raw)
+
+        assert len(calls) == 1
+        assert result["success"] is False
+        assert result["escalated"] is False
+        assert result["attempts"] == 1
+        assert result["failure_class"] == "isolation_refused"
+
+    def test_auth_failure_opens_breaker_and_never_retries(self, tmp_path, monkeypatch):
         repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
 
@@ -465,15 +495,60 @@ class TestRunWorkerEscalation:
 
         assert len(calls) == 1
         assert result["success"] is False
+        assert result["escalated"] is False
         assert result["failure_class"] == "auth"
         assert result["breaker"]["open"] is True
         assert breaker.is_open() is True
 
-    def test_structured_stdout_oauth_401_opens_breaker_and_does_not_escalate(self, tmp_path, monkeypatch):
+    def test_rate_limit_failure_never_retries(self, tmp_path, monkeypatch):
+        repo = make_git_repo(tmp_path, "repo")
+        monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
+
+        calls = []
+
+        def _fake_spawn(**kwargs):
+            calls.append(kwargs)
+            return _spawn_result(exit_code=1, stderr="Error: rate limit exceeded (429)", model=kwargs["model"])
+
+        monkeypatch.setattr(runner, "spawn_claude", _fake_spawn)
+
+        raw = runner.run_worker({"task": "fix it", "cwd": str(repo)}, session_id="sess:rate")
+        result = json.loads(raw)
+
+        assert len(calls) == 1
+        assert result["success"] is False
+        assert result["escalated"] is False
+        assert result["failure_class"] == "rate"
+        assert result["breaker"]["open"] is True
+        assert breaker.is_open() is True
+
+    def test_extra_usage_quota_failure_never_retries(self, tmp_path, monkeypatch):
+        repo = make_git_repo(tmp_path, "repo")
+        monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
+
+        calls = []
+
+        def _fake_spawn(**kwargs):
+            calls.append(kwargs)
+            return _spawn_result(exit_code=1, stderr="Error: usage limit exceeded for this plan", model=kwargs["model"])
+
+        monkeypatch.setattr(runner, "spawn_claude", _fake_spawn)
+
+        raw = runner.run_worker({"task": "fix it", "cwd": str(repo)}, session_id="sess:quota")
+        result = json.loads(raw)
+
+        assert len(calls) == 1
+        assert result["success"] is False
+        assert result["escalated"] is False
+        assert result["failure_class"] == "extra_usage"
+        assert result["breaker"]["open"] is True
+        assert breaker.is_open() is True
+
+    def test_structured_stdout_oauth_401_opens_breaker_and_never_retries(self, tmp_path, monkeypatch):
         """Claude Code's ``--output-format json`` can exit 1 with empty stderr
         and the real failure in stdout, e.g. an expired OAuth token. That must
-        classify as ``auth`` (one attempt, breaker opens, no Opus escalation),
-        not ``other`` (which would retry on Opus)."""
+        classify as ``auth`` (one spawn, breaker opens, no retry), not
+        ``other``."""
         repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
 
@@ -505,10 +580,10 @@ class TestRunWorkerEscalation:
         assert breaker.is_open() is True
         assert raw_token_marker not in raw
 
-    def test_malformed_json_stdout_with_generic_failure_still_escalates_safely(self, tmp_path, monkeypatch):
+    def test_malformed_json_stdout_with_generic_failure_never_retries(self, tmp_path, monkeypatch):
         """Non-JSON/garbled stdout must never raise and must not be
-        misclassified as auth — it should behave exactly like the existing
-        generic-failure path (escalate once to Opus)."""
+        misclassified as auth — it behaves like any other generic failure:
+        one spawn, no retry."""
         repo = make_git_repo(tmp_path, "repo")
         monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
 
@@ -516,20 +591,70 @@ class TestRunWorkerEscalation:
 
         def _fake_spawn(**kwargs):
             calls.append(kwargs)
-            if len(calls) == 1:
-                return _spawn_result(exit_code=1, stdout="not json{{{", stderr="", model=kwargs["model"])
-            return _spawn_result(exit_code=0, stdout=json.dumps({"result": "done", "is_error": False}), model=kwargs["model"])
+            return _spawn_result(exit_code=1, stdout="not json{{{", stderr="", model=kwargs["model"])
 
         monkeypatch.setattr(runner, "spawn_claude", _fake_spawn)
-        monkeypatch.setattr(runner, "_git_changed_files", lambda cwd, repo_roots=None: [])
 
         raw = runner.run_worker({"task": "fix it", "cwd": str(repo)}, session_id="sess:7")
         result = json.loads(raw)
 
-        assert len(calls) == 2
-        assert result["success"] is True
-        assert result["escalated"] is True
+        assert len(calls) == 1
+        assert result["success"] is False
+        assert result["escalated"] is False
+        assert result["attempts"] == 1
+        assert result["failure_class"] == "other"
         assert breaker.is_open() is False
+
+
+class TestExplicitComplexityRoutingEndToEnd:
+    """Requirement 1/2: Sonnet is the default whenever ``complexity`` is
+    omitted — even for task text that reads exactly like the retired
+    keyword-triggered categories — and Opus is reachable ONLY through an
+    explicit, schema-allowed ``complexity`` value."""
+
+    def _run(self, tmp_path, monkeypatch, *, task, complexity=None, session_id):
+        repo = make_git_repo(tmp_path, "repo")
+        monkeypatch.setattr(config, "_load_raw_config", lambda: _cfg_with_roots(repo))
+
+        calls = []
+
+        def _fake_spawn(**kwargs):
+            calls.append(kwargs)
+            return _spawn_result(
+                exit_code=0, stdout=json.dumps({"result": "ok", "is_error": False}),
+                model=kwargs["model"],
+            )
+
+        monkeypatch.setattr(runner, "spawn_claude", _fake_spawn)
+        monkeypatch.setattr(runner, "_git_changed_files", lambda cwd, repo_roots=None: [])
+
+        args = {"task": task, "cwd": str(repo)}
+        if complexity is not None:
+            args["complexity"] = complexity
+        result = json.loads(runner.run_worker(args, session_id=session_id))
+        return result, calls
+
+    def test_default_omitted_complexity_is_always_sonnet(self, tmp_path, monkeypatch):
+        result, calls = self._run(
+            tmp_path, monkeypatch,
+            task="investigate this potential SQL injection vulnerability",
+            session_id="sess:default-sensitive-task",
+        )
+        assert calls[0]["model"] == "claude-sonnet-5"
+        assert result["model"] == "claude-sonnet-5"
+        assert result["route_reason"] == "default"
+
+    @pytest.mark.parametrize("complexity", ["architecture", "security", "hard_debugging"])
+    def test_each_explicit_allowed_complexity_routes_to_opus(
+        self, tmp_path, monkeypatch, complexity,
+    ):
+        result, calls = self._run(
+            tmp_path, monkeypatch, task="fix a typo", complexity=complexity,
+            session_id=f"sess:complexity-{complexity}",
+        )
+        assert calls[0]["model"] == "claude-opus-5"
+        assert result["model"] == "claude-opus-5"
+        assert complexity in result["route_reason"]
 
 
 class TestRunWorkerCwdRejection:

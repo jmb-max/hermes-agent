@@ -2,8 +2,10 @@
 
 Classifies a failed spawn's exit code/stderr into ``auth`` / ``rate`` /
 ``extra_usage`` / ``other``. The first three open the breaker for that class
-with a per-class cooldown; ``other`` (a plain task failure) never opens it —
-those are handled by the one-shot escalation in ``routing.py`` instead.
+with a per-class cooldown, gating future ``claude_worker`` calls until it
+cools down; ``other`` (a plain task failure) never opens it and is simply
+returned as the run's result — there is no retry or escalation of any kind
+within one call (see ``routing.py``).
 
 State is a small JSON file under ``get_hermes_home()/claude-worker/
 breaker.json`` so it survives process restarts and is shared across

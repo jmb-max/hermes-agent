@@ -18,9 +18,12 @@ Wires together the modules in this package:
                       real (non-bare) Git worktree, symlink escapes, and
                       system-sensitive or multi-project roots. The resolved
                       root is the only directory ever bind-mounted.
-* ``routing.py``   — Sonnet-default auto routing; Opus for architecture /
-                      security / hard-debugging, or exactly one controlled
-                      escalation after a Sonnet non-breaker failure.
+* ``routing.py``   — Sonnet is always the default; Opus is chosen ONLY when
+                      the caller passes an explicit ``complexity`` that
+                      exactly matches one of the tool schema's allowed
+                      values. The text of ``task`` never influences
+                      routing, and there is no failure-driven escalation of
+                      any kind — a failure of any class is returned as-is.
 * ``breaker.py``    — a per-failure-class (auth/rate/extra_usage) circuit
                        breaker with cooldown; open means no spawn, no retry.
 * ``trust.py``      — root-owned/non-symlink/non-world-writable path-chain
@@ -97,9 +100,13 @@ TOOL_SCHEMA: Dict[str, Any] = {
     "description": (
         "Delegate a coding task to an isolated Claude Code CLI subprocess, "
         "authenticated via the installed Claude Code OAuth session (never "
-        "an API key). Auto-routes between claude-sonnet-5 (default) and "
-        "claude-opus-5 (architecture/security/hard-debugging tasks, or one "
-        "controlled escalation after a Sonnet failure). Runs isolated: an "
+        "an API key). Always uses claude-sonnet-5 unless the caller passes "
+        "an explicit complexity value (architecture/security/"
+        "hard_debugging), which routes to claude-opus-5 instead — the task "
+        "text itself never affects model choice. Exactly one spawn attempt "
+        "is ever made: a failure of any kind (timeout, nonzero exit, "
+        "isolation refusal, auth/quota, or anything else) is returned as-is "
+        "and never retried on a different model. Runs isolated: an "
         "empty, strict MCP config, a scoped tool allowlist, and a cwd "
         "pinned to the canonical Git worktree root resolved from the "
         "requested cwd — that one repository is the only directory mounted "
@@ -135,8 +142,10 @@ TOOL_SCHEMA: Dict[str, Any] = {
                 "type": "string",
                 "enum": ["architecture", "security", "hard_debugging"],
                 "description": (
-                    "Optional explicit complexity hint that forces "
-                    "claude-opus-5 routing regardless of keyword detection."
+                    "Optional explicit complexity hint. This is the ONLY "
+                    "way to route to claude-opus-5 — the task text is never "
+                    "scanned or otherwise considered. Omit it (the default) "
+                    "for claude-sonnet-5."
                 ),
             },
             "allow_terra_fallback": {

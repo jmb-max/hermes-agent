@@ -115,8 +115,10 @@ class TestImmutableModels:
     def test_allowlist_is_exactly_two_models(self):
         assert policy.MODEL_ALLOWLIST == frozenset({"claude-sonnet-5", "claude-opus-5"})
 
-    def test_max_attempts_is_two(self):
-        assert policy.MAX_ATTEMPTS == 2
+    def test_max_attempts_is_one(self):
+        """No failure-driven escalation exists any more: exactly one spawn
+        per call, ever — a failure of any class is returned as-is."""
+        assert policy.MAX_ATTEMPTS == 1
 
     def test_no_config_lookup_in_policy_module(self):
         source = open(policy.__file__, encoding="utf-8").read()
@@ -134,7 +136,7 @@ class TestImmutableSandboxPolicy:
 
     def test_image_id_is_the_activated_immutable_local_image(self):
         assert policy.SANDBOX_IMAGE_ID == (
-            "sha256:46dc23aaa53c845dacb081dbd71d865a1772fdb2af51fb28ee8f4bfa35f8dc80"
+            "sha256:5e5a8ac6f202a552b6b5bf01dc9b666fdef2218826043123c2140585c0645e26"
         )
         digest = policy.SANDBOX_IMAGE_ID.split(":", 1)[1]
         assert len(digest) == 64
